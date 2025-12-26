@@ -1,24 +1,24 @@
--- Remote Renamer Script
--- Автоматически переименовывает RemoteEvents/RemoteFunctions в имена их скриптов-источников
+-- Remote Renamer by Calling Script
+-- Переименовывает ремоуты в имена скриптов, которые их вызывают
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 
+-- Хук для отслеживания вызовов ремоутов
+local remoteCallers = {} -- {remoteDebugId = {scriptName, callCount}}
+local originalNamecall
+
 -- Конфигурация
 local CONFIG = {
+    MONITOR_TIME = 10, -- Время мониторинга вызовов в секундах
+    MIN_CALLS = 1, -- Минимальное количество вызовов для анализа
+    RENAME_ENABLED = true,
     DEBUG_MODE = true,
     SEND_TO_WEBHOOK = true,
-    WEBHOOK_URL = "https://discord.com/api/webhooks/1434181472423776277/wrgeevBbOT05meDtUawJvTomccDgrCn8qml8x2Y18fRhAswj_fOPE3LLM13-R3bCkC7g",
-    RENAME_IN_GAME = true, -- Автоматически переименовывать в игре
-    USE_RAW_METHOD = false -- Использовать rawset для обхода защиты
+    WEBHOOK_URL = "https://discord.com/api/webhooks/1434181472423776277/wrgeevBbOT05meDtUawJvTomccDgrCn8qml8x2Y18fRhAswj_fOPE3LLM13-R3bCkC7g"
 }
-
--- Глобальные переменные
-local renameHistory = {}
-local remoteStats = {}
-local lastExecutionTime = tick()
 
 -- Функции логирования
 local function log(message, ...)
@@ -31,44 +31,47 @@ local function errorLog(message, ...)
     warn(string.format("[RemoteRenamer ERROR] " .. message, ...))
 end
 
--- Функция для получения чистого имени из пути
-local function getCleanNameFromPath(path)
-    if not path or path == "" then
-        return nil
-    end
+-- Функция для получения информации о calling script
+local function getCallingScriptInfo()
+    -- Получаем стек вызовов
+    local stack = debug.traceback()
     
-    -- Убираем кавычки и лишние символы
-    local cleanPath = path:gsub('["\']', ''):gsub(":", "")
-    
-    -- Разбиваем путь на части
-    local parts = {}
-    for part in cleanPath:gmatch("[^%.]+") do
-        table.insert(parts, part)
-    end
-    
-    -- Ищем подходящее имя (последнее не-служебное)
-    for i = #parts, 1, -1 do
-        local name = parts[i]
-        
-        -- Пропускаем служебные имена
-        if not (name:find("Remote") or 
-                name:find("Module") or 
-                name:find("Script") or
-                name:find("Replicated") or
-                name:find("Server") or
-                name:find("Client") or
-                name:find("Workspace") or
-                name:find("Players") or
-                #name < 3) then
-            
-            -- Очищаем имя от нежелательных символов
-            local cleaned = name:gsub("%s+", "_")
-                           :gsub("[^%w_]", "")
-                           :gsub("^%d+", "") -- Убираем цифры в начале
-                           :sub(1, 50) -- Ограничиваем длину
-            
-            if #cleaned >= 3 then
-                return cleaned
+    -- Ищем скрипты в стеке
+    for line in stack:gmatch("[^\n]+") do
+        -- Ищем пути к скриптам
+        if line:find("Script") and not line:find("Remote") then
+            -- Извлекаем путь к скрипту
+            local scriptPath = line:match("(%w+%.?)+Script")
+            if scriptPath then
+                -- Пробуем найти экземпляр скрипта
+                local success, script = pcall(function()
+                    local pathParts = {}
+                    for part in scriptPath:gmatch("[^%.]+") do
+                        table.insert(pathParts, part)
+                    end
+                    
+                    -- Ищем скрипт в иерархии
+                    local current = game
+                    for i, part in ipairs(pathParts) do
+                        local child = current:FindFirstChild(part)
+                        if child then
+                            current = child
+                        else
+                            return nil
+                        end
+                    end
+                    
+                    return current
+                end)
+                
+                if success and script then
+                    return {
+                        Instance = script,
+                        Name = script.Name,
+                        ClassName = script.ClassName,
+                        Path = script:GetFullName()
+                    }
+                end
             end
         end
     end
@@ -76,104 +79,88 @@ local function getCleanNameFromPath(path)
     return nil
 end
 
--- Функция для получения информации о скрипте
-local function getScriptInfo(scriptInstance)
-    if not scriptInstance or typeof(scriptInstance) ~= "Instance" then
-        return nil
-    end
+-- Хук для отслеживания вызовов RemoteEvents/RemoteFunctions
+local function setupRemoteHook()
+    log("Установка хука для отслеживания вызовов ремоутов...")
     
-    -- Получаем полный путь к скрипту
-    local success, fullPath = pcall(function()
-        local path = {}
-        local current = scriptInstance
+    local function getNamecallHook(...)
+        local method = getnamecallmethod()
         
-        while current and current ~= game do
-            local name = current.Name
-            if name:find("[^%w_]") then
-                name = string.format('["%s"]', name)
+        if method and (method == "FireServer" or method == "InvokeServer") then
+            local remote = ...
+            if remote and typeof(remote) == "Instance" then
+                if remote:IsA("RemoteEvent") or remote:IsA("RemoteFunction") or remote:IsA("UnreliableRemoteEvent") then
+                    -- Получаем calling script
+                    local callingScript = getCallingScriptInfo()
+                    
+                    if callingScript then
+                        local debugId = game.GetDebugId(remote)
+                        
+                        if not remoteCallers[debugId] then
+                            remoteCallers[debugId] = {
+                                scriptName = callingScript.Name,
+                                scriptPath = callingScript.Path,
+                                callCount = 1,
+                                remoteInstance = remote,
+                                className = remote.ClassName,
+                                originalName = remote.Name
+                            }
+                        else
+                            remoteCallers[debugId].callCount = remoteCallers[debugId].callCount + 1
+                            
+                            -- Если нашли другой скрипт, выбираем тот, который чаще вызывает
+                            if remoteCallers[debugId].callCount > 2 then
+                                remoteCallers[debugId].scriptName = callingScript.Name
+                                remoteCallers[debugId].scriptPath = callingScript.Path
+                            end
+                        end
+                        
+                        log("Зафиксирован вызов: %s -> %s (вызовов: %d)", 
+                            remote.Name, callingScript.Name, remoteCallers[debugId].callCount)
+                    end
+                end
             end
-            table.insert(path, 1, name)
-            current = current.Parent
         end
         
-        if #path > 0 then
-            return table.concat(path, ".")
-        end
-        return scriptInstance.Name
-    end)
-    
-    if success and fullPath then
-        return {
-            Path = fullPath,
-            CleanName = getCleanNameFromPath(fullPath),
-            Instance = scriptInstance
-        }
+        return originalNamecall(...)
     end
     
-    return nil
+    -- Сохраняем оригинальный namecall
+    if getrawmetatable then
+        local mt = getrawmetatable(game)
+        if mt then
+            originalNamecall = mt.__namecall
+            if setreadonly then
+                setreadonly(mt, false)
+            end
+            mt.__namecall = newcclosure(getNamecallHook)
+            if setreadonly then
+                setreadonly(mt, true)
+            end
+            log("Хук успешно установлен")
+        end
+    end
 end
 
--- Функция для сбора информации о ремоутах
-local function collectRemoteInfo()
-    log("Начинаем сбор информации о ремоутах...")
-    
-    local allRemotes = {}
-    
-    -- Функция рекурсивного поиска ремоутов
-    local function searchInContainer(container)
-        for _, child in ipairs(container:GetChildren()) do
-            if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") or child:IsA("UnreliableRemoteEvent") then
-                table.insert(allRemotes, {
-                    Instance = child,
-                    Path = child:GetFullName(),
-                    Parent = child.Parent,
-                    ClassName = child.ClassName,
-                    OriginalName = child.Name
-                })
-            end
-            
-            -- Рекурсивно проверяем дочерние объекты
-            searchInContainer(child)
-        end
+-- Функция для получения чистого имени скрипта
+local function getCleanScriptName(scriptName, remoteName)
+    if not scriptName or scriptName == "" then
+        return remoteName .. "_Renamed"
     end
     
-    -- Ищем ремоуты в основных контейнерах
-    local containers = {
-        ReplicatedStorage,
-        game:GetService("ServerScriptService"),
-        game:GetService("ServerStorage"),
-        game:GetService("Workspace"),
-        game:GetService("Players")
-    }
+    -- Очищаем имя от нежелательных символов
+    local cleanName = scriptName
+        :gsub("%s+", "_")
+        :gsub("[^%w_]", "")
+        :gsub("^%d+", "")
+        :sub(1, 50)
     
-    for _, container in ipairs(containers) do
-        searchInContainer(container)
+    -- Проверяем, не является ли имя слишком коротким
+    if #cleanName < 3 then
+        return remoteName .. "_Renamed"
     end
     
-    log("Найдено %d ремоутов", #allRemotes)
-    return allRemotes
-end
-
--- Функция для создания нового имени на основе скрипта
-local function generateRemoteName(remote, scriptInfo, counter)
-    if not scriptInfo or not scriptInfo.CleanName then
-        -- Если нет информации о скрипте, используем родительский путь
-        local parentName = getCleanNameFromPath(remote.Parent:GetFullName())
-        if parentName then
-            return string.format("%s_Remote_%d", parentName, counter or 1)
-        end
-        return string.format("RenamedRemote_%d", counter or 1)
-    end
-    
-    -- Используем очищенное имя скрипта
-    local baseName = scriptInfo.CleanName
-    
-    -- Добавляем суффикс для уникальности
-    if counter and counter > 1 then
-        return string.format("%s_%d", baseName, counter)
-    end
-    
-    return baseName
+    return cleanName
 end
 
 -- Функция переименования ремоута
@@ -184,9 +171,17 @@ local function renameRemote(remote, newName)
     
     local originalName = remote.Name
     
-    if CONFIG.USE_RAW_METHOD then
-        -- Агрессивный метод через rawset
-        local success, result = pcall(function()
+    local success, result = pcall(function()
+        remote.Name = newName
+        return true
+    end)
+    
+    if success then
+        log("Переименовано: %s -> %s", originalName, newName)
+        return true
+    else
+        -- Пробуем агрессивный метод
+        local aggressiveSuccess = pcall(function()
             local rawMeta = getrawmetatable(remote)
             if rawMeta then
                 local wasReadonly = isreadonly and isreadonly(rawMeta)
@@ -204,32 +199,20 @@ local function renameRemote(remote, newName)
             return false
         end)
         
-        if success then
+        if aggressiveSuccess then
             log("Агрессивно переименовано: %s -> %s", originalName, newName)
             return true
         end
-    end
-    
-    -- Стандартный метод
-    local success, result = pcall(function()
-        remote.Name = newName
-        return true
-    end)
-    
-    if success then
-        log("Переименовано: %s -> %s", originalName, newName)
-        return true
-    else
+        
         errorLog("Ошибка переименования %s: %s", originalName, result)
         return false, result
     end
 end
 
--- Основная функция переименования
-local function renameAllRemotes()
-    log("=== НАЧАЛО ПЕРЕИМЕНОВАНИЯ РЕМОУТОВ ===")
+-- Основная функция переименования на основе calling script
+local function renameByCallingScript()
+    log("=== ПЕРЕИМЕНОВАНИЕ ПО CALLING SCRIPT ===")
     
-    local allRemotes = collectRemoteInfo()
     local renameResults = {
         success = 0,
         failed = 0,
@@ -237,208 +220,143 @@ local function renameAllRemotes()
         details = {}
     }
     
-    -- Группируем ремоуты по родительским контейнерам
-    local groupedRemotes = {}
-    for _, remote in ipairs(allRemotes) do
-        local parentPath = remote.Parent:GetFullName()
-        if not groupedRemotes[parentPath] then
-            groupedRemotes[parentPath] = {}
-        end
-        table.insert(groupedRemotes[parentPath], remote)
-    end
+    local generatedScript = "-- Remote Rename by Calling Script\n-- Generated at: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n\n"
+    local renameCommands = {}
     
-    -- Переименовываем ремоуты
-    for parentPath, remotes in pairs(groupedRemotes) do
-        log("Обрабатываем контейнер: %s", parentPath)
-        
-        -- Собираем информацию о скриптах в этом контейнере
-        local scriptNames = {}
-        local scriptsInContainer = {}
-        
-        -- Ищем скрипты в контейнере
-        local function collectScripts(container)
-            for _, child in ipairs(container:GetChildren()) do
-                if child:IsA("Script") or child:IsA("LocalScript") or child:IsA("ModuleScript") then
-                    local scriptInfo = getScriptInfo(child)
-                    if scriptInfo and scriptInfo.CleanName then
-                        scriptNames[scriptInfo.CleanName] = (scriptNames[scriptInfo.CleanName] or 0) + 1
-                        scriptsInContainer[child] = scriptInfo
+    -- Обрабатываем все зафиксированные ремоуты
+    for debugId, callerInfo in pairs(remoteCallers) do
+        if callerInfo.callCount >= CONFIG.MIN_CALLS then
+            local remote = callerInfo.remoteInstance
+            
+            if remote and remote.Parent then
+                local newName = getCleanScriptName(callerInfo.scriptName, callerInfo.originalName)
+                
+                -- Проверяем уникальность имени
+                local counter = 1
+                local finalName = newName
+                while remote.Parent:FindFirstChild(finalName) and finalName ~= remote.Name do
+                    counter = counter + 1
+                    finalName = newName .. "_" .. counter
+                end
+                
+                if remote.Name == finalName then
+                    log("Пропуск: %s уже имеет имя %s", remote.Name, finalName)
+                    renameResults.skipped = renameResults.skipped + 1
+                else
+                    -- Создаем команду переименования
+                    local command = string.format([[
+-- Remote: %s (calls: %d, caller: %s)
+local remote = %s:FindFirstChild("%s", true)
+if remote then
+    remote.Name = "%s"
+    print("Renamed: %s -> %s")
+end]],
+                        callerInfo.originalName,
+                        callerInfo.callCount,
+                        callerInfo.scriptName,
+                        "game",
+                        callerInfo.originalName,
+                        finalName,
+                        callerInfo.originalName,
+                        finalName
+                    )
+                    
+                    table.insert(renameCommands, command)
+                    
+                    -- Пытаемся переименовать сразу
+                    if CONFIG.RENAME_ENABLED then
+                        local success, errorMsg = renameRemote(remote, finalName)
+                        
+                        if success then
+                            renameResults.success = renameResults.success + 1
+                            log("✓ Успех: %s -> %s (вызывал: %s, раз: %d)", 
+                                callerInfo.originalName, finalName, callerInfo.scriptName, callerInfo.callCount)
+                        else
+                            renameResults.failed = renameResults.failed + 1
+                            errorLog("✗ Ошибка: %s -> %s: %s", callerInfo.originalName, finalName, errorMsg)
+                        end
+                        
+                        table.insert(renameResults.details, {
+                            status = success and "success" or "failed",
+                            original = callerInfo.originalName,
+                            new = finalName,
+                            caller = callerInfo.scriptName,
+                            calls = callerInfo.callCount,
+                            path = remote:GetFullName(),
+                            error = errorMsg
+                        })
+                    else
+                        renameResults.skipped = renameResults.skipped + 1
+                        table.insert(renameResults.details, {
+                            status = "skipped",
+                            original = callerInfo.originalName,
+                            new = finalName,
+                            caller = callerInfo.scriptName,
+                            calls = callerInfo.callCount,
+                            path = remote:GetFullName(),
+                            error = "RENAME_ENABLED = false"
+                        })
                     end
                 end
-                collectScripts(child)
-            end
-        end
-        
-        collectScripts(remotes[1].Parent)
-        
-        -- Переименовываем каждый ремоут
-        local usedNames = {}
-        
-        for _, remote in ipairs(remotes) do
-            -- Находим ближайший скрипт к ремоуту
-            local nearestScript = nil
-            local currentParent = remote.Instance.Parent
-            
-            while currentParent and currentParent ~= game do
-                for scriptInstance, scriptInfo in pairs(scriptsInContainer) do
-                    if scriptInstance.Parent == currentParent then
-                        nearestScript = scriptInfo
-                        break
-                    end
-                end
-                
-                if nearestScript then break end
-                currentParent = currentParent.Parent
-            end
-            
-            -- Генерируем новое имя
-            local newName
-            if nearestScript then
-                local baseName = nearestScript.CleanName
-                local counter = usedNames[baseName] or 0
-                counter = counter + 1
-                usedNames[baseName] = counter
-                
-                newName = generateRemoteName(remote, nearestScript, counter > 1 and counter or nil)
-            else
-                -- Используем имя родительского контейнера
-                local parentName = getCleanNameFromPath(remote.Parent:GetFullName())
-                local counter = usedNames[parentName] or 0
-                counter = counter + 1
-                usedNames[parentName] = counter
-                
-                newName = generateRemoteName(remote, {CleanName = parentName}, counter > 1 and counter or nil)
-            end
-            
-            -- Проверяем, нужно ли переименовывать
-            if remote.OriginalName == newName then
-                log("Пропуск: %s уже имеет правильное имя", remote.OriginalName)
-                renameResults.skipped = renameResults.skipped + 1
-                table.insert(renameResults.details, {
-                    status = "skipped",
-                    original = remote.OriginalName,
-                    new = newName,
-                    path = remote.Path,
-                    reason = "Already has correct name"
-                })
-            else
-                -- Пытаемся переименовать
-                local success, errorMsg
-                
-                if CONFIG.RENAME_IN_GAME then
-                    success, errorMsg = renameRemote(remote.Instance, newName)
-                else
-                    success = true -- Только генерация скрипта
-                    errorMsg = "In-game rename disabled"
-                end
-                
-                if success then
-                    renameResults.success = renameResults.success + 1
-                    log("✓ Успех: %s -> %s", remote.OriginalName, newName)
-                else
-                    renameResults.failed = renameResults.failed + 1
-                    errorLog("✗ Ошибка: %s -> %s: %s", remote.OriginalName, newName, errorMsg)
-                end
-                
-                table.insert(renameResults.details, {
-                    status = success and "success" or "failed",
-                    original = remote.OriginalName,
-                    new = newName,
-                    path = remote.Path,
-                    error = errorMsg
-                })
             end
         end
     end
     
+    -- Собираем скрипт
+    generatedScript = generatedScript .. table.concat(renameCommands, "\n\n")
+    generatedScript = generatedScript .. string.format("\n\nprint('Renamed %d remotes!')", #renameCommands)
+    
+    -- Копируем в буфер обмена
+    if setclipboard then
+        setclipboard(generatedScript)
+        log("Скрипт скопирован в буфер обмена")
+    end
+    
+    -- Отчет
     log("=== РЕЗУЛЬТАТЫ ===")
+    log("Найдено ремоутов: %d", #renameCommands)
     log("Успешно: %d", renameResults.success)
     log("Пропущено: %d", renameResults.skipped)
     log("Ошибок: %d", renameResults.failed)
-    log("Всего обработано: %d", #allRemotes)
     
-    -- Генерация скрипта для ручного выполнения
-    local generateScript = function()
-        local scriptLines = {
-            "-- Remote Rename Script",
-            "-- Generated at: " .. os.date("%Y-%m-%d %H:%M:%S"),
-            "",
-            "local remotesToRename = {"
-        }
-        
-        for _, detail in ipairs(renameResults.details) do
-            if detail.status == "success" or detail.status == "failed" then
-                local line = string.format('    {path = "%s", old = "%s", new = "%s"},',
-                    detail.path:gsub('"', '\\"'),
-                    detail.original:gsub('"', '\\"'),
-                    detail.new:gsub('"', '\\"'))
-                table.insert(scriptLines, line)
-            end
-        end
-        
-        table.insert(scriptLines, "}")
-        table.insert(scriptLines, "")
-        table.insert(scriptLines, "for _, remoteInfo in ipairs(remotesToRename) do")
-        table.insert(scriptLines, '    local remote = game:GetService("ReplicatedStorage"):FindFirstChild(remoteInfo.old, true)')
-        table.insert(scriptLines, "    if remote then")
-        table.insert(scriptLines, "        pcall(function()")
-        table.insert(scriptLines, '            remote.Name = remoteInfo.new')
-        table.insert(scriptLines, string.format('            print("Renamed: " .. remoteInfo.old .. " -> " .. remoteInfo.new)'))
-        table.insert(scriptLines, "        end)")
-        table.insert(scriptLines, "    end")
-        table.insert(scriptLines, "end")
-        
-        return table.concat(scriptLines, "\n")
-    end
-    
-    local generatedScript = generateScript()
-    
-    -- Сохраняем в буфер обмена
-    local clipboardSuccess = pcall(function()
-        if setclipboard then
-            setclipboard(generatedScript)
-            return true
-        end
-        return false
-    end)
-    
-    -- Отправка в Discord Webhook
-    if CONFIG.SEND_TO_WEBHOOK then
+    -- Отправка в Discord
+    if CONFIG.SEND_TO_WEBHOOK and #renameCommands > 0 then
         local function sendToWebhook()
             local summary = string.format(
-                "**Remote Rename Results**\n" ..
+                "**Remote Rename by Calling Script**\n" ..
+                "⏱️ Monitor time: %d seconds\n" ..
+                "📊 Found remotes: %d\n" ..
                 "✅ Success: %d\n" ..
-                "⏭️ Skipped: %d\n" ..
                 "❌ Failed: %d\n" ..
-                "📊 Total: %d",
+                "⏭️ Skipped: %d",
+                CONFIG.MONITOR_TIME,
+                #renameCommands,
                 renameResults.success,
-                renameResults.skipped,
                 renameResults.failed,
-                #allRemotes
+                renameResults.skipped
             )
             
-            local detailsText = "```lua\n"
+            local detailsText = "```\n"
             for i, detail in ipairs(renameResults.details) do
-                if i <= 15 then -- Ограничиваем количество строк
-                    detailsText = detailsText .. string.format("%s: %s -> %s\n",
+                if i <= 10 then
+                    detailsText = detailsText .. string.format("%s: %s -> %s\n  Caller: %s (calls: %d)\n",
                         detail.status:upper(),
                         detail.original,
-                        detail.new)
-                elseif i == 16 then
-                    detailsText = detailsText .. "... and more\n"
-                    break
+                        detail.new,
+                        detail.caller,
+                        detail.calls)
                 end
             end
             detailsText = detailsText .. "```"
             
             local payload = {
                 embeds = {{
-                    title = "Remote Renamer Report",
+                    title = "Calling Script Renamer Report",
                     description = summary,
-                    color = renameResults.failed > 0 and 0xFF0000 or 0x00FF00,
+                    color = 0x00FF00,
                     fields = {
                         {
-                            name = "Details",
+                            name = "Remote Details",
                             value = detailsText,
                             inline = false
                         },
@@ -449,11 +367,11 @@ local function renameAllRemotes()
                         }
                     },
                     footer = {
-                        text = string.format("Executed by %s", Players.LocalPlayer.Name)
+                        text = "Executed by Calling Script Renamer"
                     },
                     timestamp = DateTime.now():ToIsoDate()
                 }},
-                username = "Remote Renamer"
+                username = "Calling Script Renamer"
             }
             
             local jsonPayload = HttpService:JSONEncode(payload)
@@ -468,95 +386,141 @@ local function renameAllRemotes()
                     },
                     Body = jsonPayload
                 })
-                
                 return response.Success
             end
-            
             return false
         end
         
-        local webhookSuccess, webhookResult = pcall(sendToWebhook)
-        if webhookSuccess then
+        local success, err = pcall(sendToWebhook)
+        if success then
             log("Отчет отправлен в Discord")
         else
-            errorLog("Ошибка отправки в Discord: %s", webhookResult)
+            errorLog("Ошибка отправки в Discord: %s", err)
         end
     end
-    
-    -- Вывод результатов пользователю
-    local resultMessage = string.format(
-        "Remote Renamer завершил работу!\n" ..
-        "✅ Успешно: %d\n" ..
-        "⏭️ Пропущено: %d\n" ..
-        "❌ Ошибок: %d\n" ..
-        "📊 Всего: %d\n\n" ..
-        "%sСкрипт сгенерирован!",
-        renameResults.success,
-        renameResults.skipped,
-        renameResults.failed,
-        #allRemotes,
-        clipboardSuccess and "📋 Скрипт скопирован в буфер!\n" or ""
-    )
-    
-    -- Показываем уведомление
-    if rconsoleprint then
-        rconsoleclear()
-        rconsoleprint("@@WHITE@@")
-        rconsoleprint("=== REMOTE RENAMER RESULTS ===\n")
-        rconsoleprint(resultMessage .. "\n")
-        
-        -- Показываем детали
-        rconsoleprint("\n=== DETAILS ===\n")
-        for i, detail in ipairs(renameResults.details) do
-            if i <= 20 then
-                local color = detail.status == "success" and "@@GREEN@@" or 
-                             detail.status == "failed" and "@@RED@@" or "@@YELLOW@@"
-                rconsoleprint(color)
-                rconsoleprint(string.format("%s: %s -> %s\n", 
-                    detail.status:upper(), detail.original, detail.new))
-            end
-        end
-    end
-    
-    -- Вывод в обычную консоль
-    print("\n" .. string.rep("=", 50))
-    print("REMOTE RENAMER RESULTS")
-    print(string.rep("=", 50))
-    print(resultMessage)
-    print(string.rep("=", 50))
     
     return renameResults, generatedScript
 end
 
--- Функция для создания интерфейса (опционально)
-local function createSimpleUI()
+-- Альтернативный метод: поиск всех ремоутов и их анализ
+local function findAllRemotesAndAnalyze()
+    log("Поиск всех ремоутов в игре...")
+    
+    local allRemotes = {}
+    local function searchInContainer(container)
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") or child:IsA("UnreliableRemoteEvent") then
+                table.insert(allRemotes, {
+                    Instance = child,
+                    Path = child:GetFullName(),
+                    Parent = child.Parent,
+                    ClassName = child.ClassName,
+                    OriginalName = child.Name
+                })
+            end
+            searchInContainer(child)
+        end
+    end
+    
+    searchInContainer(game)
+    log("Найдено %d ремоутов", #allRemotes)
+    
+    -- Анализируем, какие скрипты находятся рядом с ремоутами
+    for _, remoteInfo in ipairs(allRemotes) do
+        local remote = remoteInfo.Instance
+        
+        -- Ищем скрипты в родительской цепочке
+        local foundScript = nil
+        local current = remote.Parent
+        
+        while current and current ~= game do
+            for _, child in ipairs(current:GetChildren()) do
+                if child:IsA("Script") or child:IsA("LocalScript") or child:IsA("ModuleScript") then
+                    foundScript = child
+                    break
+                end
+            end
+            if foundScript then break end
+            current = current.Parent
+        end
+        
+        if foundScript then
+            local debugId = game.GetDebugId(remote)
+            remoteCallers[debugId] = {
+                scriptName = foundScript.Name,
+                scriptPath = foundScript:GetFullName(),
+                callCount = 1,
+                remoteInstance = remote,
+                className = remote.ClassName,
+                originalName = remote.Name
+            }
+            log("Найден ремоут %s рядом со скриптом %s", remote.Name, foundScript.Name)
+        end
+    end
+end
+
+-- Функция мониторинга в реальном времени
+local function startMonitoring()
+    log("Начинаем мониторинг вызовов ремоутов на %d секунд...", CONFIG.MONITOR_TIME)
+    
+    setupRemoteHook()
+    
+    -- Ждем, пока накопится статистика
+    local startTime = tick()
+    local monitoredCalls = 0
+    
+    while tick() - startTime < CONFIG.MONITOR_TIME do
+        task.wait(1)
+        
+        -- Показываем прогресс
+        local elapsed = tick() - startTime
+        local remaining = CONFIG.MONITOR_TIME - elapsed
+        
+        if math.floor(elapsed) % 5 == 0 then
+            log("Мониторинг... %d секунд осталось (найдено ремоутов: %d)", 
+                math.floor(remaining), table.count(remoteCallers))
+        end
+    end
+    
+    log("Мониторинг завершен. Найдено %d ремоутов", table.count(remoteCallers))
+    
+    -- Если ремоутов мало, ищем все
+    if table.count(remoteCallers) < 5 then
+        log("Слишком мало данных. Ищем все ремоуты в игре...")
+        findAllRemotesAndAnalyze()
+    end
+    
+    return remoteCallers
+end
+
+-- Создание интерфейса
+local function createUI()
     local screenGui = Instance.new("ScreenGui")
-    screenGui.Name = "RemoteRenamerUI"
+    screenGui.Name = "CallingScriptRenamerUI"
     screenGui.ResetOnSpawn = false
     
     local mainFrame = Instance.new("Frame")
-    mainFrame.Name = "MainFrame"
-    mainFrame.Size = UDim2.new(0, 300, 0, 200)
-    mainFrame.Position = UDim2.new(0.5, -150, 0.5, -100)
-    mainFrame.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    mainFrame.Size = UDim2.new(0, 350, 0, 250)
+    mainFrame.Position = UDim2.new(0.5, -175, 0.5, -125)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
     mainFrame.BorderSizePixel = 0
     mainFrame.Parent = screenGui
     
+    -- Заголовок
     local title = Instance.new("TextLabel")
-    title.Name = "Title"
-    title.Text = "Remote Renamer"
-    title.Size = UDim2.new(1, 0, 0, 30)
+    title.Text = "Calling Script Renamer"
+    title.Size = UDim2.new(1, 0, 0, 40)
     title.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
     title.TextColor3 = Color3.fromRGB(255, 255, 255)
     title.Font = Enum.Font.SourceSansBold
     title.TextSize = 18
     title.Parent = mainFrame
     
+    -- Статус
     local statusLabel = Instance.new("TextLabel")
-    statusLabel.Name = "Status"
     statusLabel.Text = "Готов к работе"
-    statusLabel.Size = UDim2.new(1, -20, 0, 60)
-    statusLabel.Position = UDim2.new(0, 10, 0, 40)
+    statusLabel.Size = UDim2.new(1, -20, 0, 80)
+    statusLabel.Position = UDim2.new(0, 10, 0, 50)
     statusLabel.BackgroundTransparency = 1
     statusLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
     statusLabel.Font = Enum.Font.SourceSans
@@ -564,49 +528,86 @@ local function createSimpleUI()
     statusLabel.TextWrapped = true
     statusLabel.Parent = mainFrame
     
-    local renameButton = Instance.new("TextButton")
-    renameButton.Name = "RenameButton"
-    renameButton.Text = "Переименовать все ремоуты"
-    renameButton.Size = UDim2.new(1, -20, 0, 40)
-    renameButton.Position = UDim2.new(0, 10, 0, 110)
-    renameButton.BackgroundColor3 = Color3.fromRGB(0, 120, 215)
-    renameButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-    renameButton.Font = Enum.Font.SourceSansBold
-    renameButton.TextSize = 16
-    renameButton.Parent = mainFrame
+    -- Кнопки
+    local monitorBtn = Instance.new("TextButton")
+    monitorBtn.Text = "Мониторить вызовы"
+    monitorBtn.Size = UDim2.new(0.45, -5, 0, 40)
+    monitorBtn.Position = UDim2.new(0.025, 0, 0, 140)
+    monitorBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 215)
+    monitorBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    monitorBtn.Font = Enum.Font.SourceSansBold
+    monitorBtn.TextSize = 14
+    monitorBtn.Parent = mainFrame
     
-    local closeButton = Instance.new("TextButton")
-    closeButton.Name = "CloseButton"
-    closeButton.Text = "Закрыть"
-    closeButton.Size = UDim2.new(1, -20, 0, 30)
-    closeButton.Position = UDim2.new(0, 10, 0, 160)
-    closeButton.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
-    closeButton.TextColor3 = Color3.fromRGB(255, 255, 255)
-    closeButton.Font = Enum.Font.SourceSans
-    closeButton.TextSize = 14
-    closeButton.Parent = mainFrame
+    local renameBtn = Instance.new("TextButton")
+    renameBtn.Text = "Переименовать"
+    renameBtn.Size = UDim2.new(0.45, -5, 0, 40)
+    renameBtn.Position = UDim2.new(0.525, 0, 0, 140)
+    renameBtn.BackgroundColor3 = Color3.fromRGB(50, 160, 80)
+    renameBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    renameBtn.Font = Enum.Font.SourceSansBold
+    renameBtn.TextSize = 14
+    renameBtn.Parent = mainFrame
     
-    -- Обработчики событий
-    renameButton.MouseButton1Click:Connect(function()
-        statusLabel.Text = "Выполняется переименование...\nПожалуйста, подождите."
-        renameButton.Active = false
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Text = "Закрыть"
+    closeBtn.Size = UDim2.new(1, -20, 0, 35)
+    closeBtn.Position = UDim2.new(0, 10, 0, 200)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.Font = Enum.Font.SourceSans
+    closeBtn.TextSize = 14
+    closeBtn.Parent = mainFrame
+    
+    -- Обработчики
+    monitorBtn.MouseButton1Click:Connect(function()
+        monitorBtn.Active = false
+        renameBtn.Active = false
         
-        local results, script = renameAllRemotes()
+        statusLabel.Text = "Мониторинг вызовов...\nПожалуйста, играйте в игру.\nВремя: " .. CONFIG.MONITOR_TIME .. " сек"
+        
+        startMonitoring()
         
         statusLabel.Text = string.format(
-            "Готово!\n" ..
-            "Успешно: %d\n" ..
-            "Пропущено: %d\n" ..
-            "Ошибок: %d",
-            results.success,
-            results.skipped,
-            results.failed
+            "Мониторинг завершен!\n" ..
+            "Найдено ремоутов: %d\n" ..
+            "Готово к переименованию.",
+            table.count(remoteCallers)
         )
         
-        renameButton.Active = true
+        monitorBtn.Active = true
+        renameBtn.Active = true
     end)
     
-    closeButton.MouseButton1Click:Connect(function()
+    renameBtn.MouseButton1Click:Connect(function()
+        if table.count(remoteCallers) == 0 then
+            statusLabel.Text = "Сначала проведите мониторинг!"
+            return
+        end
+        
+        monitorBtn.Active = false
+        renameBtn.Active = false
+        
+        statusLabel.Text = "Выполняется переименование..."
+        
+        local results, script = renameByCallingScript()
+        
+        statusLabel.Text = string.format(
+            "Переименование завершено!\n" ..
+            "Успешно: %d\n" ..
+            "Ошибок: %d\n" ..
+            "Пропущено: %d\n\n" ..
+            "Скрипт скопирован!",
+            results.success,
+            results.failed,
+            results.skipped
+        )
+        
+        monitorBtn.Active = true
+        renameBtn.Active = true
+    end)
+    
+    closeBtn.MouseButton1Click:Connect(function()
         screenGui:Destroy()
     end)
     
@@ -654,115 +655,67 @@ local function createSimpleUI()
     return screenGui
 end
 
--- Основная функция инициализации
-local function initialize()
-    log("Инициализация Remote Renamer...")
+-- Автоматический запуск
+local function autoStart()
+    log("=== CALLING SCRIPT RENAMER === ")
+    log("Запуск автоматического режима...")
     
-    -- Создаем интерфейс
-    local ui = createSimpleUI()
+    local ui = createUI()
     
-    -- Автоматически запускаем переименование
+    -- Автоматически начинаем мониторинг
     task.wait(2)
     
-    log("Автозапуск переименования через 3 секунды...")
-    for i = 3, 1, -1 do
-        log("Запуск через %d...", i)
+    log("Автоматический мониторинг через 5 секунд...")
+    for i = 5, 1, -1 do
+        if ui and ui:FindFirstChild("CallingScriptRenamerUI") then
+            local status = ui.CallingScriptRenamerUI.MainFrame.Status
+            if status then
+                status.Text = string.format("Автоматический запуск через %d...", i)
+            end
+        end
         task.wait(1)
     end
     
-    -- Выполняем переименование
-    local results, generatedScript = renameAllRemotes()
+    -- Запускаем мониторинг
+    startMonitoring()
     
-    -- Показываем результат в интерфейсе
-    if ui and ui:FindFirstChild("MainFrame") then
-        local statusLabel = ui.MainFrame:FindFirstChild("Status")
-        if statusLabel then
-            statusLabel.Text = string.format(
-                "Автоматическое переименование завершено!\n" ..
-                "Успешно: %d\n" ..
-                "Пропущено: %d\n" ..
-                "Ошибок: %d\n\n" ..
-                "Скрипт сгенерирован и скопирован!",
-                results.success,
-                results.skipped,
-                results.failed
-            )
+    -- Автоматически переименовываем
+    task.wait(2)
+    
+    if table.count(remoteCallers) > 0 then
+        log("Начинаем автоматическое переименование...")
+        
+        local results, script = renameByCallingScript()
+        
+        if ui and ui:FindFirstChild("CallingScriptRenamerUI") then
+            local status = ui.CallingScriptRenamerUI.MainFrame.Status
+            if status then
+                status.Text = string.format(
+                    "Автоматическое переименование завершено!\n" ..
+                    "Успешно: %d\n" ..
+                    "Ошибок: %d\n" ..
+                    "Пропущено: %d\n\n" ..
+                    "Скрипт скопирован!",
+                    results.success,
+                    results.failed,
+                    results.skipped
+                )
+            end
         end
+    else
+        log("Не найдено ремоутов для переименования")
     end
     
-    log("Remote Renamer успешно инициализирован!")
-    
-    return {
-        RenameAll = renameAllRemotes,
-        GetRemoteInfo = collectRemoteInfo,
-        UI = ui
-    }
+    log("=== ВЫПОЛНЕНИЕ ЗАВЕРШЕНО ===")
 end
 
--- Запуск скрипта
-local success, err = pcall(initialize)
-if not success then
-    errorLog("Ошибка инициализации: %s", err)
-    
-    -- Пытаемся хотя бы выполнить переименование без интерфейса
-    pcall(function()
-        renameAllRemotes()
-    end)
-end
+-- Запуск
+pcall(autoStart)
 
--- Экспорт функций для ручного использования
-getgenv().RemoteRenamer = {
-    RenameAllRemotes = renameAllRemotes,
-    CollectRemoteInfo = collectRemoteInfo,
-    GenerateScript = function()
-        local remotes = collectRemoteInfo()
-        local renameResults = {
-            success = 0,
-            failed = 0,
-            skipped = 0,
-            details = {}
-        }
-        
-        for _, remote in ipairs(remotes) do
-            table.insert(renameResults.details, {
-                original = remote.OriginalName,
-                path = remote.Path,
-                new = remote.OriginalName .. "_Renamed"
-            })
-        end
-        
-        local scriptLines = {
-            "-- Auto-generated Remote Rename Script",
-            "-- Place this script in a LocalScript",
-            "",
-            "local remotesToRename = {"
-        }
-        
-        for _, detail in ipairs(renameResults.details) do
-            table.insert(scriptLines, string.format('    {path = "%s", old = "%s", new = "%s"},',
-                detail.path, detail.original, detail.new))
-        end
-        
-        table.insert(scriptLines, "}")
-        table.insert(scriptLines, "")
-        table.insert(scriptLines, "for _, remoteInfo in ipairs(remotesToRename) do")
-        table.insert(scriptLines, '    local success, remote = pcall(function()')
-        table.insert(scriptLines, '        return game:GetService("ReplicatedStorage"):FindFirstChild(remoteInfo.old, true)')
-        table.insert(scriptLines, "    end)")
-        table.insert(scriptLines, "    if success and remote then")
-        table.insert(scriptLines, "        pcall(function()")
-        table.insert(scriptLines, "            remote.Name = remoteInfo.new")
-        table.insert(scriptLines, "        end)")
-        table.insert(scriptLines, "    end")
-        table.insert(scriptLines, "end")
-        
-        local finalScript = table.concat(scriptLines, "\n")
-        
-        if setclipboard then
-            setclipboard(finalScript)
-            print("Скрипт скопирован в буфер обмена!")
-        end
-        
-        return finalScript
-    end
+-- Экспорт функций
+getgenv().CallingScriptRenamer = {
+    StartMonitoring = startMonitoring,
+    RenameAll = renameByCallingScript,
+    GetRemoteCallers = function() return remoteCallers end,
+    FindAllRemotes = findAllRemotesAndAnalyze
 }
