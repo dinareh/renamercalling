@@ -1,549 +1,292 @@
--- Simple Remote Renamer (Passive Mode)
--- Переименовывает все RemoteEvents и RemoteFunctions без их активации
+-- Lightweight Remote Renamer
+-- Быстрое переименование всех RemoteEvents и RemoteFunctions
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local HttpService = game:GetService("HttpService")
 
--- Конфигурация
+-- Упрощенная конфигурация
 local CONFIG = {
-    WEBHOOK_URL = "https://discord.com/api/webhooks/1434181472423776277/wrgeevBbOT05meDtUawJvTomccDgrCn8qml8x2Y18fRhAswj_fOPE3LLM13-R3bCkC7g",
-    SEND_TO_DISCORD = true,
-    RENAME_IN_GAME = true,
-    DEBUG_MODE = true,
-    USE_PARENT_NAMES = true,  -- Использовать имена родительских папок
-    ADD_PREFIX = true,         -- Добавлять префикс по типу
-    MAX_NAME_LENGTH = 50       -- Максимальная длина имени
+    RENAME_IN_GAME = true,      -- Переименовывать сразу в игре
+    SIMPLE_NAMES = true,        -- Использовать простые имена
+    MAX_PER_FRAME = 5,          -- Максимум ремоутов за кадр (для оптимизации)
+    BATCH_SIZE = 50             -- Размер батча для обработки
 }
 
 -- Глобальные переменные
-local renamedRemotes = {}
 local processedRemotes = 0
 local successfullyRenamed = 0
 
--- Функция для логирования
-local function log(message)
-    if CONFIG.DEBUG_MODE then
-        print("[RemoteRenamer]: " .. message)
-    end
-end
-
--- Функция для отправки на Discord вебхук
-local function sendToDiscord(message)
-    if not CONFIG.SEND_TO_DISCORD or not CONFIG.WEBHOOK_URL then
-        return false
-    end
-    
-    local success, result = pcall(function()
-        local payload = {
-            content = message,
-            username = "Passive Remote Renamer",
-            avatar_url = "https://cdn.discordapp.com/attachments/1067061486574907412/1067061597392310292/Simple_Spy_logo.png"
-        }
-        
-        local jsonPayload = HttpService:JSONEncode(payload)
-        
-        -- Пробуем разные методы отправки
-        local requestFunc = syn and syn.request or request or http_request
-        if requestFunc then
-            requestFunc({
-                Url = CONFIG.WEBHOOK_URL,
-                Method = "POST",
-                Headers = {
-                    ["Content-Type"] = "application/json"
-                },
-                Body = jsonPayload
-            })
-        end
-        
-        return true
-    end)
-    
-    return success
-end
-
--- Функция для поиска всех ремоутов в игре
-local function findAllRemotes()
+-- Функция для быстрого поиска ремоутов
+local function findRemotesQuick()
     local remotes = {}
+    local checked = {}
     
-    -- Рекурсивная функция поиска
-    local function searchIn(instance, depth)
-        if depth > 20 then return end -- Ограничение глубины для безопасности
-        
-        -- Проверяем, является ли ремоутом
-        if instance:IsA("RemoteEvent") or instance:IsA("RemoteFunction") or instance:IsA("UnreliableRemoteEvent") then
-            table.insert(remotes, {
-                Instance = instance,
-                Path = instance:GetFullName(),
-                OriginalName = instance.Name,
-                Parent = instance.Parent,
-                ClassName = instance.ClassName,
-                Depth = depth
-            })
-        end
-        
-        -- Ищем в дочерних объектах
-        for _, child in ipairs(instance:GetChildren()) do
-            searchIn(child, depth + 1)
-        end
-    end
-    
-    -- Начинаем поиск с основных мест
-    local startPoints = {
+    -- Основные места для поиска
+    local searchLocations = {
         ReplicatedStorage,
         game:GetService("ServerStorage"),
         game:GetService("ServerScriptService"),
         game:GetService("Workspace"),
         game:GetService("StarterPack"),
-        game:GetService("StarterGui"),
-        game:GetService("StarterPlayer"),
-        game:GetService("Lighting"),
-        game:GetService("SoundService")
+        game:GetService("StarterPlayer")
     }
     
-    for _, startPoint in ipairs(startPoints) do
-        searchIn(startPoint, 0)
+    -- Быстрая проверка основных мест
+    for _, location in ipairs(searchLocations) do
+        local success, result = pcall(function()
+            local descendants = location:GetDescendants()
+            for _, obj in ipairs(descendants) do
+                if (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")) and not checked[obj] then
+                    table.insert(remotes, {
+                        Instance = obj,
+                        Name = obj.Name,
+                        Parent = obj.Parent,
+                        ClassName = obj.ClassName,
+                        Path = obj:GetFullName()
+                    })
+                    checked[obj] = true
+                end
+            end
+        end)
+        
+        if not success then
+            -- Если GetDescendants медленный, проверяем только первые уровни
+            local children = location:GetChildren()
+            for _, child in ipairs(children) do
+                if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
+                    table.insert(remotes, {
+                        Instance = child,
+                        Name = child.Name,
+                        Parent = child.Parent,
+                        ClassName = child.ClassName,
+                        Path = child:GetFullName()
+                    })
+                end
+            end
+        end
     end
     
-    log("Найдено ремоутов: " .. #remotes)
+    print("[Renamer] Найдено ремоутов: " .. #remotes)
     return remotes
 end
 
--- Функция для анализа структуры папок вокруг ремоута
-local function analyzeRemoteContext(remote)
-    local context = {
-        ParentName = remote.Parent.Name,
-        GrandparentName = remote.Parent.Parent and remote.Parent.Parent.Name or "Game",
-        SiblingRemotes = 0,
-        FolderStructure = {},
-        ScriptsNearby = 0
+-- Простая генерация имени
+local function generateSimpleName(remote, index)
+    if CONFIG.SIMPLE_NAMES then
+        local prefix = ""
+        if remote:IsA("RemoteEvent") then
+            prefix = "Event_"
+        elseif remote:IsA("RemoteFunction") then
+            prefix = "Function_"
+        end
+        
+        local parentName = remote.Parent.Name
+        local cleanParent = parentName:gsub("[^%w_]", ""):sub(1, 20)
+        
+        return prefix .. cleanParent .. "_" .. index
+    else
+        -- Более простой вариант
+        if remote:IsA("RemoteEvent") then
+            return "RemoteEvent_" .. index
+        elseif remote:IsA("RemoteFunction") then
+            return "RemoteFunction_" .. index
+        end
+        return "Remote_" .. index
+    end
+end
+
+-- Быстрое переименование батчами
+local function renameBatch(batch)
+    local results = {
+        success = 0,
+        failed = 0,
+        details = {}
     }
     
-    -- Собираем структуру папок (до 3 уровней вверх)
-    local current = remote.Parent
-    local depth = 0
-    while current and current ~= game and depth < 3 do
-        table.insert(context.FolderStructure, 1, current.Name)
-        current = current.Parent
-        depth = depth + 1
-    end
-    
-    -- Считаем другие ремоуты в той же папке
-    for _, child in ipairs(remote.Parent:GetChildren()) do
-        if child:IsA("RemoteEvent") or child:IsA("RemoteFunction") then
-            context.SiblingRemotes = context.SiblingRemotes + 1
-        end
-        -- Считаем скрипты в той же папке
-        if child:IsA("Script") or child:IsA("LocalScript") or child:IsA("ModuleScript") then
-            context.ScriptsNearby = context.ScriptsNearby + 1
-        end
-    end
-    
-    return context
-end
-
--- Функция для генерации имени на основе контекста
-local function generateNameFromContext(remote, context)
-    local baseName = ""
-    
-    -- Стратегия 1: Используем имя родительской папки
-    if CONFIG.USE_PARENT_NAMES then
-        if context.SiblingRemotes > 1 then
-            -- Если несколько ремоутов в папке, добавляем индекс
-            baseName = context.ParentName .. "_" .. context.SiblingRemotes
-        else
-            baseName = context.ParentName
-        end
-    else
-        -- Стратегия 2: Используем структуру папок
-        if #context.FolderStructure >= 2 then
-            baseName = context.FolderStructure[#context.FolderStructure - 1] .. "_" .. context.FolderStructure[#context.FolderStructure]
-        elseif #context.FolderStructure >= 1 then
-            baseName = context.FolderStructure[#context.FolderStructure]
-        else
-            baseName = "Remote"
-        end
-    end
-    
-    -- Очищаем имя
-    local cleanName = baseName:gsub("%s+", "_")
-    cleanName = cleanName:gsub("[^%w_]", "")
-    
-    -- Обрезаем если слишком длинное
-    if cleanName:len() > CONFIG.MAX_NAME_LENGTH then
-        cleanName = cleanName:sub(1, CONFIG.MAX_NAME_LENGTH)
-    end
-    
-    -- Добавляем префикс по типу
-    if CONFIG.ADD_PREFIX then
-        if remote:IsA("RemoteEvent") then
-            cleanName = "Event_" .. cleanName
-        elseif remote:IsA("RemoteFunction") then
-            cleanName = "Function_" .. cleanName
-        elseif remote:IsA("UnreliableRemoteEvent") then
-            cleanName = "Unreliable_" .. cleanName
-        end
-    else
-        -- Или добавляем суффикс
-        if remote:IsA("RemoteEvent") then
-            cleanName = cleanName .. "_Event"
-        elseif remote:IsA("RemoteFunction") then
-            cleanName = cleanName .. "_Function"
-        end
-    end
-    
-    -- Если рядом есть скрипты, добавляем пометку
-    if context.ScriptsNearby > 0 then
-        cleanName = cleanName .. "_Scripted"
-    end
-    
-    return cleanName
-end
-
--- Функция для безопасного переименования
-local function safeRename(remote, newName)
-    local originalName = remote.Name
-    
-    -- Проверяем, не пытаемся ли переименовать в то же имя
-    if originalName == newName then
-        return false, "Уже имеет это имя"
-    end
-    
-    -- Проверяем длину имени
-    if newName:len() > 100 then
-        newName = newName:sub(1, 100)
-    end
-    
-    -- Пробуем переименовать
-    local success, errorMsg = pcall(function()
-        remote.Name = newName
-    end)
-    
-    if success then
-        return true, newName
-    else
-        -- Пробуем альтернативное имя
-        local altName = "Renamed_" .. originalName:gsub("[^%w_]", "")
-        local altSuccess, altError = pcall(function()
-            remote.Name = altName
-        end)
-        
-        if altSuccess then
-            return true, altName
-        else
-            return false, errorMsg
-        end
-    end
-end
-
--- Основная функция переименования
-local function renameRemotesPassive()
-    log("Запуск Passive Remote Renamer...")
-    log("Режим: Без активации ремоутов")
-    
-    -- Находим все ремоуты
-    local allRemotes = findAllRemotes()
-    log("Всего найдено ремоутов: " .. #allRemotes)
-    
-    -- Создаем отчет
-    local report = "=== ОТЧЕТ О ПЕРЕИМЕНОВАНИИ РЕМОУТОВ ===\n"
-    report = report .. "Режим: Passive (без активации)\n"
-    report = report .. "Всего ремоутов: " .. #allRemotes .. "\n\n"
-    
-    local renameCommands = {}
-    local renameLog = {}
-    local failedRenames = {}
-    
-    -- Обрабатываем каждый ремоут
-    for index, remoteData in ipairs(allRemotes) do
-        processedRemotes = processedRemotes + 1
+    for i, remoteData in ipairs(batch) do
         local remote = remoteData.Instance
+        local newName = generateSimpleName(remote, i + processedRemotes)
         
-        log(string.format("Обработка [%d/%d]: %s", index, #allRemotes, remoteData.Path))
-        
-        -- Анализируем контекст ремоута
-        local context = analyzeRemoteContext(remote)
-        
-        -- Генерируем новое имя на основе контекста
-        local newName = generateNameFromContext(remote, context)
-        
-        -- Пробуем переименовать
-        local success, resultName = safeRename(remote, newName)
-        
-        if success then
-            successfullyRenamed = successfullyRenamed + 1
+        if remote.Name ~= newName then
+            local success, errorMsg = pcall(function()
+                remote.Name = newName
+            end)
             
-            -- Создаем команду для скрипта
-            local command = string.format([[
--- Успешно переименован
--- Путь: %s
-local remote = game:GetService("%s"):WaitForChild("%s"):WaitForChild("%s")
-if remote then
-    remote.Name = "%s"
-    print("✅ Переименован: %s -> %s")
-end]],
-                remoteData.Path,
-                remote.Parent.ClassName,
-                remote.Parent.Name,
-                resultName == newName and remoteData.OriginalName or "Renamed_" .. remoteData.OriginalName,
-                resultName,
-                remoteData.OriginalName,
-                resultName
-            )
-            
-            table.insert(renameCommands, command)
-            
-            -- Записываем в лог
-            table.insert(renameLog, {
-                OriginalName = remoteData.OriginalName,
-                NewName = resultName,
-                Path = remoteData.Path,
-                ClassName = remoteData.ClassName,
-                Context = {
-                    Parent = context.ParentName,
-                    Siblings = context.SiblingRemotes,
-                    Scripts = context.ScriptsNearby
-                },
-                Success = true
-            })
-            
-            log(string.format("  ✅ %s -> %s", remoteData.OriginalName, resultName))
+            if success then
+                results.success = results.success + 1
+                table.insert(results.details, {
+                    original = remoteData.Name,
+                    new = newName,
+                    success = true
+                })
+            else
+                results.failed = results.failed + 1
+                table.insert(results.details, {
+                    original = remoteData.Name,
+                    error = errorMsg,
+                    success = false
+                })
+            end
         else
-            -- Записываем неудачную попытку
-            table.insert(failedRenames, {
-                Remote = remoteData,
-                Error = resultName
+            table.insert(results.details, {
+                original = remoteData.Name,
+                new = newName,
+                success = true,
+                already = true
             })
-            
-            log(string.format("  ❌ %s -> Ошибка: %s", remoteData.OriginalName, resultName))
+        end
+    end
+    
+    return results
+end
+
+-- Основная функция
+local function renameRemotesLightweight()
+    print("=== Lightweight Remote Renamer ===")
+    print("Начинаю поиск ремоутов...")
+    
+    -- Находим ремоуты
+    local allRemotes = findRemotesQuick()
+    
+    if #allRemotes == 0 then
+        print("Ремоуты не найдены!")
+        return
+    end
+    
+    print("Найдено: " .. #allRemotes .. " ремоутов")
+    print("Начинаю переименование...")
+    
+    -- Разбиваем на батчи для оптимизации
+    local batches = {}
+    for i = 1, #allRemotes, CONFIG.BATCH_SIZE do
+        local batch = {}
+        for j = i, math.min(i + CONFIG.BATCH_SIZE - 1, #allRemotes) do
+            table.insert(batch, allRemotes[j])
+        end
+        table.insert(batches, batch)
+    end
+    
+    local totalResults = {
+        success = 0,
+        failed = 0,
+        skipped = 0
+    }
+    
+    local renameLog = {}
+    
+    -- Обрабатываем каждый батч
+    for batchIndex, batch in ipairs(batches) do
+        print(string.format("Батч %d/%d (%d ремоутов)", 
+            batchIndex, #batches, #batch))
+        
+        -- Небольшая задержка между батчами
+        if batchIndex > 1 then
+            wait(0.05) -- Минимальная задержка
         end
         
-        -- Небольшая задержка для стабильности
-        if index % 10 == 0 then
-            wait(0.01)
-        end
-    end
-    
-    -- Формируем итоговый скрипт
-    local finalScript = "-- === PASSIVE REMOTE RENAME SCRIPT ===\n"
-    finalScript = finalScript .. "-- Сгенерировано Passive Remote Renamer\n"
-    finalScript = finalScript .. "-- Режим: Без активации ремоутов\n"
-    finalScript = finalScript .. "-- Время: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n"
-    finalScript = finalScript .. "-- Всего ремоутов: " .. #allRemotes .. "\n"
-    finalScript = finalScript .. "-- Успешно переименовано: " .. successfullyRenamed .. "\n"
-    finalScript = finalScript .. "-- Не удалось: " .. #failedRenames .. "\n\n"
-    
-    -- Добавляем преамбулу
-    finalScript = finalScript .. "print(\"=== Passive Remote Renamer ===\")\n"
-    finalScript = finalScript .. string.format('print("Всего ремоутов: %d")', #allRemotes) .. "\n"
-    finalScript = finalScript .. string.format('print("Успешно переименовано: %d")', successfullyRenamed) .. "\n"
-    finalScript = finalScript .. string.format('print("Не удалось: %d")', #failedRenames) .. "\n\n"
-    
-    -- Добавляем команды переименования
-    if #renameCommands > 0 then
-        finalScript = finalScript .. "-- Команды переименования\n"
-        for i, command in ipairs(renameCommands) do
-            finalScript = finalScript .. command .. "\n\n"
-        end
-    end
-    
-    -- Добавляем обработку неудачных попыток
-    if #failedRenames > 0 then
-        finalScript = finalScript .. "-- Неудачные попытки\n"
-        finalScript = finalScript .. "print(\"\\nНеудачные попытки переименования:\")\n"
+        local results = renameBatch(batch)
         
-        for i, failed in ipairs(failedRenames) do
-            finalScript = finalScript .. string.format('print("%d. %s - %s")', 
-                i, 
-                failed.Remote.Path, 
-                failed.Error) .. "\n"
+        totalResults.success = totalResults.success + results.success
+        totalResults.failed = totalResults.failed + results.failed
+        
+        -- Добавляем в лог
+        for _, detail in ipairs(results.details) do
+            table.insert(renameLog, detail)
         end
-        finalScript = finalScript .. "\n"
+        
+        processedRemotes = processedRemotes + #batch
+        
+        -- Обновляем прогресс
+        print(string.format("  Прогресс: %d/%d (Успешно: %d, Ошибок: %d)", 
+            processedRemotes, #allRemotes, totalResults.success, totalResults.failed))
     end
     
-    -- Добавляем итог
-    finalScript = finalScript .. string.format([[
-print("==================================")
-print("Passive Remote Renamer завершил работу")
-print("Обработано ремоутов: %d")
-print("Успешно переименовано: %d")
-print("Не удалось: %d")
-print("==================================")]],
-        processedRemotes,
-        successfullyRenamed,
-        #failedRenames
-    )
+    -- Формируем простой отчет
+    local simpleScript = "-- Lightweight Remote Renamer Script\n"
+    simpleScript = simpleScript .. "-- Generated: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n"
+    simpleScript = simpleScript .. "-- Total remotes: " .. #allRemotes .. "\n"
+    simpleScript = simpleScript .. "-- Renamed: " .. totalResults.success .. "\n"
+    simpleScript = simpleScript .. "-- Failed: " .. totalResults.failed .. "\n\n"
     
-    -- Копируем в буфер обмена
+    -- Добавляем команды только для успешных переименований
+    for i, logEntry in ipairs(renameLog) do
+        if logEntry.success and not logEntry.already then
+            simpleScript = simpleScript .. "-- " .. logEntry.original .. " -> " .. logEntry.new .. "\n"
+        end
+    end
+    
+    simpleScript = simpleScript .. "\nprint(\"Renamed " .. totalResults.success .. " remotes\")"
+    
+    -- Копируем в буфер
     if setclipboard then
-        setclipboard(finalScript)
-        log("Скрипт скопирован в буфер обмена (" .. #finalScript .. " символов)")
+        setclipboard(simpleScript)
+        print("\nСкрипт скопирован в буфер обмена")
     end
     
-    -- Формируем подробный отчет
-    report = report .. "СТАТИСТИКА:\n"
-    report = report .. string.rep("-", 40) .. "\n"
-    report = report .. "Обработано: " .. processedRemotes .. "\n"
-    report = report .. "Успешно: " .. successfullyRenamed .. "\n"
-    report = report .. "Не удалось: " .. #failedRenames .. "\n\n"
+    -- Простой вывод результатов
+    print("\n" .. string.rep("=", 50))
+    print("РЕЗУЛЬТАТЫ:")
+    print(string.rep("-", 50))
+    print("Всего ремоутов: " .. #allRemotes)
+    print("Обработано: " .. processedRemotes)
+    print("Успешно переименовано: " .. totalResults.success)
+    print("Не удалось: " .. totalResults.failed)
+    print(string.rep("=", 50))
     
+    -- Показываем несколько примеров
     if #renameLog > 0 then
-        report = report .. "УСПЕШНО ПЕРЕИМЕНОВАННЫЕ РЕМОУТЫ:\n"
-        report = report .. string.rep("=", 80) .. "\n"
-        
-        for i, logEntry in ipairs(renameLog) do
-            report = report .. string.format("%-30s → %-30s [%s]\n", 
-                logEntry.OriginalName, 
-                logEntry.NewName,
-                logEntry.ClassName)
-            report = report .. "    Путь: " .. logEntry.Path .. "\n"
-            report = report .. "    Контекст: Родитель=" .. logEntry.Context.Parent .. 
-                         ", Соседи=" .. logEntry.Context.Siblings .. 
-                         ", Скрипты=" .. logEntry.Context.Scripts .. "\n"
-            report = report .. string.rep("-", 80) .. "\n"
-        end
-    end
-    
-    if #failedRenames > 0 then
-        report = report .. "\nНЕУДАЧНЫЕ ПОПЫТКИ:\n"
-        report = report .. string.rep("=", 80) .. "\n"
-        
-        for i, failed in ipairs(failedRenames) do
-            report = report .. string.format("%s\n", failed.Remote.Path)
-            report = report .. "    Ошибка: " .. failed.Error .. "\n"
-            report = report .. string.rep("-", 80) .. "\n"
-        end
-    end
-    
-    -- Формируем сообщение для Discord
-    local discordMessage = "**Passive Remote Renamer - Отчет**\n\n"
-    discordMessage = discordMessage .. "**Режим:** Без активации ремоутов\n"
-    discordMessage = discordMessage .. "**Статистика:**\n"
-    discordMessage = discordMessage .. "```\n"
-    discordMessage = discordMessage .. "Всего ремоутов: " .. #allRemotes .. "\n"
-    discordMessage = discordMessage .. "Успешно: " .. successfullyRenamed .. "\n"
-    discordMessage = discordMessage .. "Не удалось: " .. #failedRenames .. "\n"
-    discordMessage = discordMessage .. "```\n\n"
-    
-    if #renameLog > 0 then
-        discordMessage = discordMessage .. "**Примеры переименований:**\n"
-        discordMessage = discordMessage .. "```\n"
-        
-        for i = 1, math.min(10, #renameLog) do
+        print("\nПримеры переименований:")
+        local examples = math.min(5, #renameLog)
+        for i = 1, examples do
             local logEntry = renameLog[i]
-            discordMessage = discordMessage .. string.format("%s → %s\n", 
-                logEntry.OriginalName, 
-                logEntry.NewName)
+            if logEntry.success then
+                print(string.format("  %s → %s", logEntry.original, logEntry.new))
+            end
         end
         
-        if #renameLog > 10 then
-            discordMessage = discordMessage .. "... и еще " .. (#renameLog - 10) .. "\n"
-        end
-        
-        discordMessage = discordMessage .. "```\n"
-    end
-    
-    -- Отправляем на Discord
-    if CONFIG.SEND_TO_DISCORD then
-        local webhookSuccess = sendToDiscord(discordMessage)
-        if webhookSuccess then
-            log("Отчет отправлен на Discord")
+        if #renameLog > examples then
+            print("  ... и еще " .. (#renameLog - examples))
         end
     end
-    
-    -- Показываем уведомление
-    if Players.LocalPlayer then
-        spawn(function()
-            local PlayerGui = Players.LocalPlayer:WaitForChild("PlayerGui")
-            local notification = Instance.new("ScreenGui", PlayerGui)
-            notification.Name = "RemoteRenamerNotification"
-            notification.ResetOnSpawn = false
-            
-            local frame = Instance.new("Frame", notification)
-            frame.Size = UDim2.new(0, 350, 0, 200)
-            frame.Position = UDim2.new(0.5, -175, 0.5, -100)
-            frame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-            frame.BorderSizePixel = 0
-            
-            local title = Instance.new("TextLabel", frame)
-            title.Size = UDim2.new(1, 0, 0, 40)
-            title.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-            title.Text = "Passive Remote Renamer"
-            title.TextColor3 = Color3.new(1, 1, 1)
-            title.TextSize = 18
-            
-            local stats = Instance.new("TextLabel", frame)
-            stats.Position = UDim2.new(0, 20, 0, 50)
-            stats.Size = UDim2.new(1, -40, 0, 80)
-            stats.BackgroundTransparency = 1
-            stats.Text = string.format("Обработано: %d\nУспешно: %d\nНе удалось: %d\n\nСкрипт в буфере обмена", 
-                processedRemotes, 
-                successfullyRenamed,
-                #failedRenames)
-            stats.TextColor3 = Color3.new(1, 1, 1)
-            stats.TextSize = 14
-            stats.TextWrapped = true
-            
-            local closeBtn = Instance.new("TextButton", frame)
-            closeBtn.Position = UDim2.new(0.5, -50, 1, -40)
-            closeBtn.Size = UDim2.new(0, 100, 0, 30)
-            closeBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 215)
-            closeBtn.Text = "Закрыть"
-            closeBtn.TextColor3 = Color3.new(1, 1, 1)
-            
-            closeBtn.MouseButton1Click:Connect(function()
-                notification:Destroy()
-            end)
-            
-            -- Автоматическое закрытие через 15 секунд
-            delay(15, function()
-                if notification and notification.Parent then
-                    notification:Destroy()
-                end
-            end)
-        end)
-    end
-    
-    -- Выводим отчет в консоль
-    print("\n" .. report)
-    log("Passive Remote Renamer завершил работу")
     
     return {
-        TotalRemotes = #allRemotes,
-        Processed = processedRemotes,
-        SuccessfullyRenamed = successfullyRenamed,
-        Failed = #failedRenames,
-        Script = finalScript,
-        Log = renameLog
+        total = #allRemotes,
+        processed = processedRemotes,
+        success = totalResults.success,
+        failed = totalResults.failed,
+        script = simpleScript
     }
 end
 
--- Запускаем переименование
-local success, result = pcall(renameRemotesPassive)
+-- Запускаем с защитой от ошибок
+local success, result = pcall(renameRemotesLightweight)
 
 if not success then
-    log("Критическая ошибка: " .. tostring(result))
+    print("Ошибка: " .. tostring(result))
     
-    -- Простой fallback метод
-    log("Пробуем простой метод...")
+    -- Максимально простая альтернатива
+    print("\nПробую альтернативный простой метод...")
     
-    local simpleSuccess = pcall(function()
-        local count = 0
-        local function renameAll(obj)
-            if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
-                local newName = "Renamed_" .. obj.Name:gsub("[^%w_]", "")
-                pcall(function() obj.Name = newName end)
+    local count = 0
+    local function quickRename(obj)
+        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
+            pcall(function()
+                obj.Name = "Renamed_" .. tostring(count)
                 count = count + 1
-            end
-            
-            for _, child in ipairs(obj:GetChildren()) do
-                renameAll(child)
-            end
+            end)
         end
-        
-        renameAll(game)
-        log("Простой метод переименовал: " .. count .. " ремоутов")
-    end)
+    end
+    
+    -- Только основные места
+    local locations = {ReplicatedStorage, workspace}
+    for _, loc in ipairs(locations) do
+        local children = loc:GetChildren()
+        for _, child in ipairs(children) do
+            quickRename(child)
+        end
+    end
+    
+    print("Быстро переименовано: " .. count .. " ремоутов")
 end
 
-log("Скрипт завершил выполнение")
+print("\nГотово!")
