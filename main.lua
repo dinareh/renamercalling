@@ -1,823 +1,545 @@
 -- Simple Remote Renamer
--- Автономный скрипт для переименования ремоутов по их calling script
+-- Автоматически переименовывает все RemoteEvents и RemoteFunctions в игре
+-- На основе скриптов, которые их вызывают
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
 
--- Настройки
-local SETTINGS = {
-    MaxNameLength = 50,
-    AddRandomSuffix = true,
-    RenameAllRemotes = true, -- Переименовать все ремоуты, даже те, что не найдены в логах
-    ShowDetailsMenu = true
+-- Конфигурация
+local CONFIG = {
+    WEBHOOK_URL = "https://discord.com/api/webhooks/1434181472423776277/wrgeevBbOT05meDtUawJvTomccDgrCn8qml8x2Y18fRhAswj_fOPE3LLM13-R3bCkC7g",
+    SEND_TO_DISCORD = true,
+    RENAME_IN_GAME = true,
+    DEBUG_MODE = true
 }
 
 -- Глобальные переменные
-local remoteLogs = {}
-local originalNames = {}
-local renameOperations = {}
-local mainGui = nil
+local renamedRemotes = {}
+local remoteCallers = {}
+local processedRemotes = 0
+local successfullyRenamed = 0
 
--- Утилиты
-local function deepClone(tbl, seen)
-    if type(tbl) ~= 'table' then return tbl end
-    if seen and seen[tbl] then return seen[tbl] end
-    
-    local copy = {}
-    seen = seen or {}
-    seen[tbl] = copy
-    
-    for k, v in pairs(tbl) do
-        copy[deepClone(k, seen)] = deepClone(v, seen)
+-- Функция для логирования
+local function log(message)
+    if CONFIG.DEBUG_MODE then
+        print("[RemoteRenamer]: " .. message)
     end
-    return setmetatable(copy, getmetatable(tbl))
 end
 
-local function getScriptName(scriptInstance)
-    if not scriptInstance then return "Unknown" end
-    
-    local path = {}
-    local current = scriptInstance
-    
-    while current and current ~= game do
-        table.insert(path, 1, current.Name)
-        current = current.Parent
+-- Функция для отправки на Discord вебхук
+local function sendToDiscord(message)
+    if not CONFIG.SEND_TO_DISCORD or not CONFIG.WEBHOOK_URL then
+        return false
     end
     
-    local fullPath = table.concat(path, "_")
-    -- Очищаем от недопустимых символов
-    fullPath = fullPath:gsub("[^%w_]", "_")
+    local success, result = pcall(function()
+        local payload = {
+            content = message,
+            username = "Remote Renamer",
+            avatar_url = "https://cdn.discordapp.com/attachments/1067061486574907412/1067061597392310292/Simple_Spy_logo.png"
+        }
+        
+        local jsonPayload = HttpService:JSONEncode(payload)
+        
+        -- Пробуем разные методы отправки
+        local requestFunc = syn and syn.request or request or http_request
+        if requestFunc then
+            requestFunc({
+                Url = CONFIG.WEBHOOK_URL,
+                Method = "POST",
+                Headers = {
+                    ["Content-Type"] = "application/json"
+                },
+                Body = jsonPayload
+            })
+        else
+            -- Альтернативный метод через HttpPostAsync
+            HttpService:PostAsync(CONFIG.WEBHOOK_URL, jsonPayload, Enum.HttpContentType.ApplicationJson)
+        end
+        
+        return true
+    end)
     
-    return fullPath
+    return success
 end
 
-local function generateRemoteName(scriptName, originalName, index)
-    local baseName = scriptName
-    if baseName == "Unknown" then
-        baseName = originalName:gsub("[^%w_]", "_")
-    end
-    
-    local newName = baseName
-    
-    -- Добавляем суффикс для уникальности
-    if SETTINGS.AddRandomSuffix then
-        newName = string.format("%s_%03d", newName, math.random(100, 999))
-    end
-    
-    -- Ограничиваем длину
-    if #newName > SETTINGS.MaxNameLength then
-        newName = newName:sub(1, SETTINGS.MaxNameLength)
-    end
-    
-    -- Гарантируем уникальность в рамках сессии
-    newName = string.format("%s_R%d", newName, index or 1)
-    
-    return newName
-end
-
--- Сбор информации о ремоутах
-local function collectRemoteInformation()
+-- Функция для поиска всех ремоутов в игре
+local function findAllRemotes()
     local remotes = {}
-    local remoteCount = 0
     
-    -- Функция для рекурсивного поиска ремоутов
-    local function searchForRemotes(instance)
-        if instance:IsA("RemoteEvent") or instance:IsA("RemoteFunction") then
-            remoteCount = remoteCount + 1
+    -- Рекурсивная функция поиска
+    local function searchIn(instance)
+        if instance:IsA("RemoteEvent") or instance:IsA("RemoteFunction") or instance:IsA("UnreliableRemoteEvent") then
             table.insert(remotes, {
                 Instance = instance,
+                Path = instance:GetFullName(),
                 OriginalName = instance.Name,
-                ClassName = instance.ClassName,
-                ParentPath = instance:GetFullName(),
-                Index = remoteCount
+                Parent = instance.Parent,
+                ClassName = instance.ClassName
             })
         end
         
-        -- Рекурсивно проверяем дочерние объекты
+        -- Ищем в дочерних объектах
         for _, child in ipairs(instance:GetChildren()) do
-            searchForRemotes(child)
+            searchIn(child)
         end
     end
     
-    -- Ищем ремоуты во всем игровом дереве
-    searchForRemotes(game)
+    -- Начинаем поиск с основных мест
+    searchIn(game)
     
-    return remotes, remoteCount
+    log("Найдено ремоутов: " .. #remotes)
+    return remotes
 end
 
--- Получение calling script для ремоутов
-local function getCallingScriptInfo(remote)
-    local callingScripts = {}
-    
-    -- Пытаемся найти вызовы через hookfunction или другие методы
-    if hookfunction and getconnections then
-        local success, connections = pcall(getconnections, remote.OnClientEvent)
-        if success and connections then
-            for _, connection in ipairs(connections) do
-                local func = connection.Function
-                if func then
-                    local env = getfenv(func)
-                    local script = env.script
-                    if script then
-                        table.insert(callingScripts, script)
-                    end
-                end
-            end
-        end
-    end
-    
-    -- Альтернативный метод: ищем скрипты, которые могут использовать этот ремоут
-    local potentialScripts = {}
-    local remoteName = remote.Name
-    
-    local function searchScripts(instance)
-        if instance:IsA("LocalScript") or instance:IsA("Script") then
-            -- Проверяем содержимое скрипта (если доступно)
-            local source = ""
-            pcall(function()
-                source = instance.Source
-            end)
-            
-            if source:find(remoteName, 1, true) then
-                table.insert(potentialScripts, instance)
-            end
-        end
-        
-        for _, child in ipairs(instance:GetChildren()) do
-            searchScripts(child)
-        end
-    end
-    
-    searchScripts(game)
-    
-    -- Объединяем результаты
-    for _, script in ipairs(potentialScripts) do
-        local alreadyExists = false
-        for _, existing in ipairs(callingScripts) do
-            if existing == script then
-                alreadyExists = true
-                break
-            end
-        end
-        if not alreadyExists then
-            table.insert(callingScripts, script)
-        end
-    end
-    
-    return callingScripts
-end
-
--- Создание GUI меню
-local function createMenu()
-    if mainGui and mainGui.Parent then
-        mainGui:Destroy()
-    end
-    
-    mainGui = Instance.new("ScreenGui")
-    mainGui.Name = "RemoteRenamerGUI"
-    mainGui.ResetOnSpawn = false
-    mainGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    
-    local MainFrame = Instance.new("Frame")
-    MainFrame.Name = "MainFrame"
-    MainFrame.Size = UDim2.new(0, 400, 0, 500)
-    MainFrame.Position = UDim2.new(0.5, -200, 0.5, -250)
-    MainFrame.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-    MainFrame.BorderSizePixel = 0
-    MainFrame.Parent = mainGui
-    
-    local TopBar = Instance.new("Frame")
-    TopBar.Name = "TopBar"
-    TopBar.Size = UDim2.new(1, 0, 0, 30)
-    TopBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-    TopBar.BorderSizePixel = 0
-    TopBar.Parent = MainFrame
-    
-    local Title = Instance.new("TextLabel")
-    Title.Name = "Title"
-    Title.Size = UDim2.new(1, -60, 1, 0)
-    Title.Position = UDim2.new(0, 10, 0, 0)
-    Title.BackgroundTransparency = 1
-    Title.Text = "Remote Renamer v2.0"
-    Title.TextColor3 = Color3.new(1, 1, 1)
-    Title.TextSize = 14
-    Title.TextXAlignment = Enum.TextXAlignment.Left
-    Title.Parent = TopBar
-    
-    local CloseButton = Instance.new("TextButton")
-    CloseButton.Name = "CloseButton"
-    CloseButton.Size = UDim2.new(0, 30, 0, 30)
-    CloseButton.Position = UDim2.new(1, -30, 0, 0)
-    CloseButton.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
-    CloseButton.BorderSizePixel = 0
-    CloseButton.Text = "X"
-    CloseButton.TextColor3 = Color3.new(1, 1, 1)
-    CloseButton.TextSize = 14
-    CloseButton.Parent = TopBar
-    
-    CloseButton.MouseButton1Click:Connect(function()
-        mainGui:Destroy()
-    end)
-    
-    local ContentFrame = Instance.new("Frame")
-    ContentFrame.Name = "ContentFrame"
-    ContentFrame.Size = UDim2.new(1, -20, 1, -50)
-    ContentFrame.Position = UDim2.new(0, 10, 0, 40)
-    ContentFrame.BackgroundTransparency = 1
-    ContentFrame.Parent = MainFrame
-    
-    -- Таблица с ремоутами
-    local RemoteList = Instance.new("ScrollingFrame")
-    RemoteList.Name = "RemoteList"
-    RemoteList.Size = UDim2.new(1, 0, 0.7, 0)
-    RemoteList.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
-    RemoteList.BorderSizePixel = 0
-    RemoteList.ScrollBarThickness = 4
-    RemoteList.CanvasSize = UDim2.new(0, 0, 0, 0)
-    RemoteList.Parent = ContentFrame
-    
-    local UIListLayout = Instance.new("UIListLayout")
-    UIListLayout.Padding = UDim.new(0, 2)
-    UIListLayout.Parent = RemoteList
-    
-    -- Панель управления
-    local ControlPanel = Instance.new("Frame")
-    ControlPanel.Name = "ControlPanel"
-    ControlPanel.Size = UDim2.new(1, 0, 0.3, -10)
-    ControlPanel.Position = UDim2.new(0, 0, 0.7, 10)
-    ControlPanel.BackgroundTransparency = 1
-    ControlPanel.Parent = ContentFrame
-    
-    -- Кнопки действий
-    local buttonTemplates = {
-        {
-            Name = "ScanButton",
-            Text = "🔍 Сканировать ремоуты",
-            Position = UDim2.new(0, 0, 0, 0),
-            Size = UDim2.new(1, 0, 0, 30),
-            Callback = function()
-                scanRemotes()
-            end
-        },
-        {
-            Name = "RenameButton",
-            Text = "🔄 Переименовать все",
-            Position = UDim2.new(0, 0, 0, 35),
-            Size = UDim2.new(1, 0, 0, 30),
-            Callback = function()
-                renameAllRemotes()
-            end
-        },
-        {
-            Name = "GenerateScriptButton",
-            Text = "📋 Сгенерировать скрипт",
-            Position = UDim2.new(0, 0, 0, 70),
-            Size = UDim2.new(1, 0, 0, 30),
-            Callback = function()
-                generateRenameScript()
-            end
-        },
-        {
-            Name = "SettingsButton",
-            Text = "⚙️ Настройки",
-            Position = UDim2.new(0, 0, 0, 105),
-            Size = UDim2.new(1, 0, 0, 30),
-            Callback = function()
-                showSettingsMenu()
-            end
-        }
+-- Функция для получения информации о вызове ремоута
+local function getRemoteCallerInfo(remote)
+    -- Этот метод использует debug.traceback для отслеживания вызовов
+    -- Внимание: может не работать в некоторых окружениях
+    local callerInfo = {
+        ScriptName = "Unknown",
+        ScriptPath = "Unknown",
+        FunctionName = "Unknown"
     }
     
-    for _, template in ipairs(buttonTemplates) do
-        local button = Instance.new("TextButton")
-        button.Name = template.Name
-        button.Size = template.Size
-        button.Position = template.Position
-        button.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-        button.BorderSizePixel = 0
-        button.Text = template.Text
-        button.TextColor3 = Color3.new(1, 1, 1)
-        button.TextSize = 12
-        button.Parent = ControlPanel
-        
-        button.MouseButton1Click:Connect(template.Callback)
-        
-        -- Эффект наведения
-        button.MouseEnter:Connect(function()
-            button.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
-        end)
-        
-        button.MouseLeave:Connect(function()
-            button.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-        end)
-    end
-    
-    -- Статус бар
-    local StatusBar = Instance.new("TextLabel")
-    StatusBar.Name = "StatusBar"
-    StatusBar.Size = UDim2.new(1, 0, 0, 20)
-    StatusBar.Position = UDim2.new(0, 0, 1, -20)
-    StatusBar.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-    StatusBar.BorderSizePixel = 0
-    StatusBar.Text = "Готов к работе"
-    StatusBar.TextColor3 = Color3.new(1, 1, 1)
-    StatusBar.TextSize = 12
-    StatusBar.Parent = ContentFrame
-    
-    -- Функция для обновления статуса
-    function updateStatus(message)
-        StatusBar.Text = message
-    end
-    
-    -- Добавление ремоута в список
-    function addRemoteToList(remoteInfo, index)
-        local RemoteItem = Instance.new("Frame")
-        RemoteItem.Name = "RemoteItem_" .. index
-        RemoteItem.Size = UDim2.new(1, 0, 0, 40)
-        RemoteItem.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-        RemoteItem.BorderSizePixel = 0
-        RemoteItem.Parent = RemoteList
-        
-        local NameLabel = Instance.new("TextLabel")
-        NameLabel.Name = "NameLabel"
-        NameLabel.Size = UDim2.new(0.6, -5, 0.5, 0)
-        NameLabel.Position = UDim2.new(0, 5, 0, 2)
-        NameLabel.BackgroundTransparency = 1
-        NameLabel.Text = remoteInfo.OriginalName
-        NameLabel.TextColor3 = Color3.new(1, 1, 1)
-        NameLabel.TextSize = 11
-        NameLabel.TextXAlignment = Enum.TextXAlignment.Left
-        NameLabel.TextTruncate = Enum.TextTruncate.AtEnd
-        NameLabel.Parent = RemoteItem
-        
-        local NewNameLabel = Instance.new("TextLabel")
-        NewNameLabel.Name = "NewNameLabel"
-        NewNameLabel.Size = UDim2.new(0.6, -5, 0.5, 0)
-        NewNameLabel.Position = UDim2.new(0, 5, 0.5, 2)
-        NewNameLabel.BackgroundTransparency = 1
-        NewNameLabel.Text = remoteInfo.NewName or "..."
-        NewNameLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
-        NewNameLabel.TextSize = 10
-        NewNameLabel.TextXAlignment = Enum.TextXAlignment.Left
-        NewNameLabel.TextTruncate = Enum.TextTruncate.AtEnd
-        NewNameLabel.Parent = RemoteItem
-        
-        local ClassLabel = Instance.new("TextLabel")
-        ClassLabel.Name = "ClassLabel"
-        ClassLabel.Size = UDim2.new(0.4, -5, 0.5, 0)
-        ClassLabel.Position = UDim2.new(0.6, 5, 0, 2)
-        ClassLabel.BackgroundTransparency = 1
-        ClassLabel.Text = remoteInfo.ClassName
-        ClassLabel.TextColor3 = Color3.fromRGB(180, 180, 255)
-        ClassLabel.TextSize = 11
-        ClassLabel.TextXAlignment = Enum.TextXAlignment.Right
-        ClassLabel.Parent = RemoteItem
-        
-        local PathLabel = Instance.new("TextLabel")
-        PathLabel.Name = "PathLabel"
-        PathLabel.Size = UDim2.new(0.4, -5, 0.5, 0)
-        PathLabel.Position = UDim2.new(0.6, 5, 0.5, 2)
-        PathLabel.BackgroundTransparency = 1
-        PathLabel.Text = remoteInfo.SourceScript or "Неизвестно"
-        PathLabel.TextColor3 = Color3.fromRGB(255, 180, 180)
-        PathLabel.TextSize = 9
-        PathLabel.TextXAlignment = Enum.TextXAlignment.Right
-        PathLabel.TextTruncate = Enum.TextTruncate.AtEnd
-        PathLabel.Parent = RemoteItem
-        
-        -- Обновление размера канваса
-        RemoteList.CanvasSize = UDim2.new(0, 0, 0, UIListLayout.AbsoluteContentSize.Y)
-    end
-    
-    -- Функция сканирования
-    function scanRemotes()
-        updateStatus("🔍 Сканирование ремоутов...")
-        RemoteList:ClearAllChildren()
-        
-        local remotes, count = collectRemoteInformation()
-        updateStatus(string.format("Найдено ремоутов: %d", count))
-        
-        remoteLogs = {}
-        
-        for index, remoteInfo in ipairs(remotes) do
-            -- Получаем информацию о calling script
-            local callingScripts = getCallingScriptInfo(remoteInfo.Instance)
-            local sourceScript = "Неизвестно"
-            
-            if #callingScripts > 0 then
-                sourceScript = getScriptName(callingScripts[1])
-                if #callingScripts > 1 then
-                    sourceScript = sourceScript .. " (+" .. (#callingScripts - 1) .. ")"
-                end
+    -- Пробуем получить информацию через debug.traceback
+    local success, traceback = pcall(function()
+        -- Создаем временную функцию для вызова
+        local function tempCall()
+            if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
+                remote:FireServer("__REMOTE_RENAMER_PROBE__")
+            elseif remote:IsA("RemoteFunction") then
+                remote:InvokeServer("__REMOTE_RENAMER_PROBE__")
             end
-            
-            remoteInfo.SourceScript = sourceScript
-            remoteInfo.NewName = generateRemoteName(sourceScript, remoteInfo.OriginalName, index)
-            
-            table.insert(remoteLogs, remoteInfo)
-            addRemoteToList(remoteInfo, index)
-            
-            -- Сохраняем оригинальное имя
-            originalNames[remoteInfo.Instance] = remoteInfo.OriginalName
         end
         
-        updateStatus(string.format("✅ Сканирование завершено: %d ремоутов", #remoteLogs))
-    end
+        -- Запускаем и перехватываем ошибку
+        xpcall(tempCall, function(err)
+            return debug.traceback(err)
+        end)
+    end)
     
-    -- Функция переименования
-    function renameAllRemotes()
-        if #remoteLogs == 0 then
-            updateStatus("❌ Сначала выполните сканирование!")
-            return
-        end
-        
-        updateStatus("🔄 Начинаю переименование...")
-        
-        local successCount = 0
-        local failCount = 0
-        renameOperations = {}
-        
-        for _, remoteInfo in ipairs(remoteLogs) do
-            local success, errorMsg = pcall(function()
-                remoteInfo.Instance.Name = remoteInfo.NewName
+    if success and traceback then
+        -- Анализируем traceback для поиска информации о скрипте
+        for line in traceback:gmatch("[^\n]+") do
+            if line:find("Script") and not line:find("RemoteRenamer") then
+                -- Пробуем извлечь имя скрипта
+                local scriptMatch = line:match("(%w+%.lua)")
+                if scriptMatch then
+                    callerInfo.ScriptName = scriptMatch:gsub("%.lua$", "")
+                    break
+                end
                 
-                -- Записываем операцию
-                table.insert(renameOperations, {
-                    OriginalName = remoteInfo.OriginalName,
-                    NewName = remoteInfo.NewName,
-                    Instance = remoteInfo.Instance,
-                    Timestamp = os.time(),
-                    Success = true
-                })
-                
-                successCount = successCount + 1
-                
-                -- Обновляем отображение
-                for _, item in ipairs(RemoteList:GetChildren()) do
-                    if item:IsA("Frame") and item.Name:find("RemoteItem_") then
-                        local nameLabel = item:FindFirstChild("NameLabel")
-                        if nameLabel and nameLabel.Text == remoteInfo.OriginalName then
-                            nameLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
-                        end
+                -- Альтернативный поиск
+                local pathMatch = line:match("game%.([%w%.]+)")
+                if pathMatch then
+                    callerInfo.ScriptPath = pathMatch
+                    -- Извлекаем последнюю часть как имя
+                    local parts = {}
+                    for part in pathMatch:gmatch("[%w_]+") do
+                        table.insert(parts, part)
                     end
+                    if #parts > 0 then
+                        callerInfo.ScriptName = parts[#parts]
+                    end
+                    break
                 end
-            end)
-            
-            if not success then
-                failCount = failCount + 1
-                table.insert(renameOperations, {
-                    OriginalName = remoteInfo.OriginalName,
-                    NewName = remoteInfo.NewName,
-                    Instance = remoteInfo.Instance,
-                    Timestamp = os.time(),
-                    Success = false,
-                    Error = errorMsg
-                })
             end
-            
-            task.wait(0.05) -- Небольшая задержка между операциями
-        end
-        
-        updateStatus(string.format("✅ Переименовано: %d | ❌ Ошибок: %d", successCount, failCount))
-        
-        -- Показываем детальный отчет
-        if SETTINGS.ShowDetailsMenu then
-            showResultsMenu(successCount, failCount)
         end
     end
     
-    -- Генерация скрипта
-    function generateRenameScript()
-        if #remoteLogs == 0 then
-            updateStatus("❌ Нет данных для генерации скрипта!")
-            return
+    return callerInfo
+end
+
+-- Альтернативный метод: анализ существующих вызовов через хук
+local function hookRemotesForAnalysis()
+    log("Начинаем анализ вызовов ремоутов...")
+    
+    -- Временное хранилище для отслеживания вызовов
+    local callTracker = {}
+    
+    -- Создаем защищенные ссылки на оригинальные методы
+    local originalFireServer
+    local originalInvokeServer
+    
+    -- Функция для отслеживания вызовов FireServer
+    local function trackFireServer(remote, ...)
+        local callerScript = getcallingscript()
+        if callerScript then
+            local remoteId = tostring(remote)
+            if not callTracker[remoteId] then
+                callTracker[remoteId] = {
+                    Remote = remote,
+                    CallerScript = callerScript,
+                    CallCount = 0
+                }
+            end
+            callTracker[remoteId].CallCount = callTracker[remoteId].CallCount + 1
+            log("Вызов FireServer: " .. remote.Name .. " из " .. callerScript.Name)
         end
         
-        local scriptLines = {
-            "-- Remote Rename Script",
-            "-- Generated by Remote Renamer v2.0",
-            "-- " .. os.date("%Y-%m-%d %H:%M:%S"),
-            "",
-            "local function renameRemotes()",
-            "    print(\"Starting remote rename operation...\")",
-            "",
-            "    local remotesToRename = {"
+        -- Вызываем оригинальный метод
+        if originalFireServer then
+            return originalFireServer(remote, ...)
+        end
+    end
+    
+    -- Функция для отслеживания вызовов InvokeServer
+    local function trackInvokeServer(remote, ...)
+        local callerScript = getcallingscript()
+        if callerScript then
+            local remoteId = tostring(remote)
+            if not callTracker[remoteId] then
+                callTracker[remoteId] = {
+                    Remote = remote,
+                    CallerScript = callerScript,
+                    CallCount = 0
+                }
+            end
+            callTracker[remoteId].CallCount = callTracker[remoteId].CallCount + 1
+            log("Вызов InvokeServer: " .. remote.Name .. " из " .. callerScript.Name)
+        end
+        
+        -- Вызываем оригинальный метод
+        if originalInvokeServer then
+            return originalInvokeServer(remote, ...)
+        end
+    end
+    
+    -- Пробуем установить хуки
+    local success = pcall(function()
+        -- Сохраняем оригинальные методы
+        local remoteEvent = Instance.new("RemoteEvent")
+        local remoteFunction = Instance.new("RemoteFunction")
+        
+        originalFireServer = remoteEvent.FireServer
+        originalInvokeServer = remoteFunction.InvokeServer
+        
+        remoteEvent:Destroy()
+        remoteFunction:Destroy()
+        
+        -- Устанавливаем хуки
+        if hookfunction then
+            hookfunction(originalFireServer, trackFireServer)
+            hookfunction(originalInvokeServer, trackInvokeServer)
+            log("Хуки установлены успешно")
+        else
+            log("hookfunction не доступен")
+        end
+    end)
+    
+    if not success then
+        log("Не удалось установить хуки, используем альтернативный метод")
+    end
+    
+    return callTracker
+end
+
+-- Функция для генерации нового имени на основе скрипта
+local function generateNewName(remote, callerInfo)
+    local baseName = callerInfo.ScriptName
+    
+    -- Если не удалось определить имя скрипта, используем родительскую папку
+    if baseName == "Unknown" or baseName:len() < 2 then
+        baseName = remote.Parent.Name
+    end
+    
+    -- Очищаем имя
+    local cleanName = baseName:gsub("%s+", "_")
+    cleanName = cleanName:gsub("[^%w_]", "")
+    
+    -- Добавляем суффикс в зависимости от типа
+    if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
+        return cleanName .. "_Event"
+    elseif remote:IsA("RemoteFunction") then
+        return cleanName .. "_Function"
+    end
+    
+    return cleanName .. "_Remote"
+end
+
+-- Основная функция переименования
+local function renameRemotes()
+    log("Запуск Remote Renamer...")
+    
+    -- Находим все ремоуты
+    local allRemotes = findAllRemotes()
+    log("Всего найдено ремоутов: " .. #allRemotes)
+    
+    -- Собираем информацию о вызовах
+    local callTracker = hookRemotesForAnalysis()
+    
+    -- Ждем немного для сбора статистики
+    log("Сбор статистики вызовов (5 секунд)...")
+    wait(5)
+    
+    -- Создаем отчет
+    local report = "=== ОТЧЕТ О ПЕРЕИМЕНОВАНИИ РЕМОУТОВ ===\n\n"
+    report = report .. "Всего ремоутов: " .. #allRemotes .. "\n"
+    
+    local renameCommands = {}
+    local renameLog = {}
+    
+    -- Обрабатываем каждый ремоут
+    for _, remoteData in ipairs(allRemotes) do
+        processedRemotes = processedRemotes + 1
+        local remote = remoteData.Instance
+        
+        -- Получаем информацию о вызывающем скрипте
+        local callerInfo = {
+            ScriptName = "Unknown",
+            ScriptPath = "Unknown"
         }
         
-        for _, remoteInfo in ipairs(remoteLogs) do
-            local line = string.format('        {original = "%s", new = "%s", class = "%s", path = "%s"},',
-                remoteInfo.OriginalName,
-                remoteInfo.NewName,
-                remoteInfo.ClassName,
-                remoteInfo.ParentPath
+        -- Проверяем, есть ли информация в трекере
+        local remoteId = tostring(remote)
+        if callTracker and callTracker[remoteId] then
+            local trackerData = callTracker[remoteId]
+            if trackerData.CallerScript then
+                callerInfo.ScriptName = trackerData.CallerScript.Name
+                callerInfo.ScriptPath = trackerData.CallerScript:GetFullName()
+            end
+        else
+            -- Используем альтернативный метод
+            callerInfo = getRemoteCallerInfo(remote)
+        end
+        
+        -- Генерируем новое имя
+        local newName = generateNewName(remote, callerInfo)
+        
+        -- Проверяем, нужно ли переименовывать
+        if newName ~= remote.Name then
+            -- Создаем команду для переименования
+            local command = string.format([[
+-- Переименование: %s -> %s
+-- Тип: %s
+-- Путь: %s
+-- Вызывающий скрипт: %s
+local remote = game:GetService("%s"):WaitForChild("%s"):WaitForChild("%s")
+if remote then
+    remote.Name = "%s"
+    print("✅ Переименован: %s -> %s")
+end
+]],
+                remote.Name,
+                newName,
+                remote.ClassName,
+                remote:GetFullName(),
+                callerInfo.ScriptName,
+                remote.Parent.ClassName,
+                remote.Parent.Name,
+                remote.Name,
+                newName,
+                remote.Name,
+                newName
             )
-            table.insert(scriptLines, line)
+            
+            table.insert(renameCommands, command)
+            
+            -- Записываем в лог
+            table.insert(renameLog, {
+                OriginalName = remote.Name,
+                NewName = newName,
+                Path = remote:GetFullName(),
+                ClassName = remote.ClassName,
+                CallerScript = callerInfo.ScriptName,
+                Command = command
+            })
+            
+            -- Пробуем переименовать в игре
+            if CONFIG.RENAME_IN_GAME then
+                local success = pcall(function()
+                    remote.Name = newName
+                    successfullyRenamed = successfullyRenamed + 1
+                    log("Успешно переименован: " .. remoteData.OriginalName .. " -> " .. newName)
+                end)
+                
+                if not success then
+                    log("Не удалось переименовать: " .. remoteData.OriginalName .. " (защищен)")
+                end
+            end
+        end
+    end
+    
+    -- Формируем итоговый скрипт
+    local finalScript = "-- === AUTO REMOTE RENAME SCRIPT ===\n"
+    finalScript = finalScript .. "-- Сгенерировано Remote Renamer\n"
+    finalScript = finalScript .. "-- Время: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n"
+    finalScript = finalScript .. "-- Всего ремоутов: " .. #allRemotes .. "\n"
+    finalScript = finalScript .. "-- Для переименования: " .. #renameCommands .. "\n\n"
+    
+    for i, command in ipairs(renameCommands) do
+        finalScript = finalScript .. command .. "\n\n"
+    end
+    
+    finalScript = finalScript .. string.format([[
+print("==================================")
+print("Remote Renamer завершил работу")
+print("Обработано ремоутов: %d")
+print("Успешно переименовано: %d")
+print("==================================")]],
+        processedRemotes,
+        successfullyRenamed
+    )
+    
+    -- Копируем в буфер обмена
+    if setclipboard then
+        setclipboard(finalScript)
+        log("Скрипт скопирован в буфер обмена (" .. #finalScript .. " символов)")
+    end
+    
+    -- Формируем отчет для Discord
+    local discordMessage = "**Remote Renamer - Отчет**\n\n"
+    discordMessage = discordMessage .. "**Статистика:**\n"
+    discordMessage = discordMessage .. "• Всего ремоутов: " .. #allRemotes .. "\n"
+    discordMessage = discordMessage .. "• Обработано: " .. processedRemotes .. "\n"
+    discordMessage = discordMessage .. "• Успешно переименовано: " .. successfullyRenamed .. "\n\n"
+    
+    if #renameLog > 0 then
+        discordMessage = discordMessage .. "**Переименованные ремоуты:**\n"
+        discordMessage = discordMessage .. "```\n"
+        
+        for i, logEntry in ipairs(renameLog) do
+            if i <= 15 then -- Ограничиваем для Discord
+                discordMessage = discordMessage .. string.format("%s → %s\n", 
+                    logEntry.OriginalName, 
+                    logEntry.NewName)
+            end
         end
         
-        table.insert(scriptLines, "    }")
-        table.insert(scriptLines, "")
-        table.insert(scriptLines, "    for _, remoteData in ipairs(remotesToRename) do")
-        table.insert(scriptLines, '        local remote = game:GetService("ReplicatedStorage"):FindFirstChild(remoteData.original)')
-        table.insert(scriptLines, "        if remote then")
-        table.insert(scriptLines, '            remote.Name = remoteData.new')
-        table.insert(scriptLines, string.format('            print("✓ Renamed: " .. remoteData.original .. " -> " .. remoteData.new)'))
-        table.insert(scriptLines, "        else")
-        table.insert(scriptLines, '            print("✗ Not found: " .. remoteData.original)')
-        table.insert(scriptLines, "        end")
-        table.insert(scriptLines, "        task.wait(0.05)")
-        table.insert(scriptLines, "    end")
-        table.insert(scriptLines, "")
-        table.insert(scriptLines, '    print("Rename operation completed!")')
-        table.insert(scriptLines, "end")
-        table.insert(scriptLines, "")
-        table.insert(scriptLines, "-- Execute the function")
-        table.insert(scriptLines, "renameRemotes()")
+        if #renameLog > 15 then
+            discordMessage = discordMessage .. "... и еще " .. (#renameLog - 15) .. "\n"
+        end
         
-        local fullScript = table.concat(scriptLines, "\n")
-        
-        -- Копируем в буфер обмена
-        if setclipboard then
-            setclipboard(fullScript)
-            updateStatus("📋 Скрипт скопирован в буфер обмена!")
+        discordMessage = discordMessage .. "```\n"
+    end
+    
+    discordMessage = discordMessage .. "**Скрипт:**\n"
+    discordMessage = discordMessage .. "```lua\n" .. finalScript:sub(1, 1000) .. "\n...\n```"
+    
+    -- Отправляем на Discord
+    if CONFIG.SEND_TO_DISCORD then
+        local webhookSuccess = sendToDiscord(discordMessage)
+        if webhookSuccess then
+            log("Отчет отправлен на Discord")
         else
-            updateStatus("❌ Функция setclipboard недоступна")
+            log("Не удалось отправить отчет на Discord")
         end
     end
     
-    -- Показ меню настроек
-    function showSettingsMenu()
-        local SettingsFrame = Instance.new("Frame")
-        SettingsFrame.Name = "SettingsFrame"
-        SettingsFrame.Size = UDim2.new(0, 300, 0, 200)
-        SettingsFrame.Position = UDim2.new(0.5, -150, 0.5, -100)
-        SettingsFrame.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-        SettingsFrame.BorderSizePixel = 0
-        SettingsFrame.ZIndex = 20
-        SettingsFrame.Parent = mainGui
+    -- Выводим итоговый отчет
+    report = report .. "Обработано: " .. processedRemotes .. "\n"
+    report = report .. "Успешно переименовано: " .. successfullyRenamed .. "\n\n"
+    
+    if #renameLog > 0 then
+        report = report .. "СПИСОК ПЕРЕИМЕНОВАНИЙ:\n"
+        report = report .. string.rep("=", 50) .. "\n"
         
-        local SettingsTitle = Instance.new("TextLabel")
-        SettingsTitle.Name = "SettingsTitle"
-        SettingsTitle.Size = UDim2.new(1, 0, 0, 30)
-        SettingsTitle.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-        SettingsTitle.BorderSizePixel = 0
-        SettingsTitle.Text = "Настройки"
-        SettingsTitle.TextColor3 = Color3.new(1, 1, 1)
-        SettingsTitle.TextSize = 14
-        SettingsTitle.Parent = SettingsFrame
+        for _, logEntry in ipairs(renameLog) do
+            report = report .. string.format("[%s] %s → %s\n", 
+                logEntry.ClassName,
+                logEntry.OriginalName,
+                logEntry.NewName)
+            report = report .. "    Путь: " .. logEntry.Path .. "\n"
+            report = report .. "    Скрипт: " .. logEntry.CallerScript .. "\n"
+            report = report .. string.rep("-", 50) .. "\n"
+        end
+    end
+    
+    -- Показываем уведомление
+    if Players.LocalPlayer then
+        local notification = Instance.new("ScreenGui", Players.LocalPlayer:WaitForChild("PlayerGui"))
+        local frame = Instance.new("Frame", notification)
+        frame.Size = UDim2.new(0, 300, 0, 150)
+        frame.Position = UDim2.new(0.5, -150, 0.5, -75)
+        frame.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
         
-        local CloseSettings = Instance.new("TextButton")
-        CloseSettings.Name = "CloseSettings"
-        CloseSettings.Size = UDim2.new(0, 30, 0, 30)
-        CloseSettings.Position = UDim2.new(1, -30, 0, 0)
-        CloseSettings.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
-        CloseSettings.BorderSizePixel = 0
-        CloseSettings.Text = "X"
-        CloseSettings.TextColor3 = Color3.new(1, 1, 1)
-        CloseSettings.TextSize = 14
-        CloseSettings.Parent = SettingsFrame
+        local title = Instance.new("TextLabel", frame)
+        title.Size = UDim2.new(1, 0, 0, 40)
+        title.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+        title.Text = "Remote Renamer"
+        title.TextColor3 = Color3.new(1, 1, 1)
+        title.TextSize = 18
         
-        CloseSettings.MouseButton1Click:Connect(function()
-            SettingsFrame:Destroy()
+        local message = Instance.new("TextLabel", frame)
+        message.Position = UDim2.new(0, 10, 0, 50)
+        message.Size = UDim2.new(1, -20, 0, 60)
+        message.BackgroundTransparency = 1
+        message.Text = string.format("Обработано: %d\nПереименовано: %d\nСкрипт в буфере", 
+            processedRemotes, successfullyRenamed)
+        message.TextColor3 = Color3.new(1, 1, 1)
+        message.TextSize = 14
+        
+        local closeBtn = Instance.new("TextButton", frame)
+        closeBtn.Position = UDim2.new(0.5, -50, 1, -35)
+        closeBtn.Size = UDim2.new(0, 100, 0, 30)
+        closeBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 215)
+        closeBtn.Text = "Закрыть"
+        closeBtn.TextColor3 = Color3.new(1, 1, 1)
+        
+        closeBtn.MouseButton1Click:Connect(function()
+            notification:Destroy()
         end)
         
-        local Content = Instance.new("Frame")
-        Content.Name = "Content"
-        Content.Size = UDim2.new(1, -20, 1, -50)
-        Content.Position = UDim2.new(0, 10, 0, 40)
-        Content.BackgroundTransparency = 1
-        Content.Parent = SettingsFrame
-        
-        -- Настройки
-        local settingOptions = {
-            {
-                Name = "AddRandomSuffix",
-                Text = "Добавлять случайный суффикс",
-                Value = SETTINGS.AddRandomSuffix,
-                Type = "checkbox"
-            },
-            {
-                Name = "ShowDetailsMenu",
-                Text = "Показывать меню с результатами",
-                Value = SETTINGS.ShowDetailsMenu,
-                Type = "checkbox"
-            },
-            {
-                Name = "RenameAllRemotes",
-                Text = "Переименовывать все ремоуты",
-                Value = SETTINGS.RenameAllRemotes,
-                Type = "checkbox"
-            }
-        }
-        
-        local yOffset = 0
-        for _, option in ipairs(settingOptions) do
-            local Checkbox = Instance.new("TextButton")
-            Checkbox.Name = "Checkbox_" .. option.Name
-            Checkbox.Size = UDim2.new(1, 0, 0, 25)
-            Checkbox.Position = UDim2.new(0, 0, 0, yOffset)
-            Checkbox.BackgroundColor3 = option.Value and Color3.fromRGB(80, 180, 80) or Color3.fromRGB(80, 80, 80)
-            Checkbox.BorderSizePixel = 0
-            Checkbox.Text = option.Text
-            Checkbox.TextColor3 = Color3.new(1, 1, 1)
-            Checkbox.TextSize = 12
-            Checkbox.Parent = Content
-            
-            Checkbox.MouseButton1Click:Connect(function()
-                SETTINGS[option.Name] = not SETTINGS[option.Name]
-                Checkbox.BackgroundColor3 = SETTINGS[option.Name] and Color3.fromRGB(80, 180, 80) or Color3.fromRGB(80, 80, 80)
-            end)
-            
-            yOffset = yOffset + 30
-        end
-    end
-    
-    -- Показ результатов
-    function showResultsMenu(successCount, failCount)
-        local ResultsFrame = Instance.new("Frame")
-        ResultsFrame.Name = "ResultsFrame"
-        ResultsFrame.Size = UDim2.new(0, 350, 0, 250)
-        ResultsFrame.Position = UDim2.new(0.5, -175, 0.5, -125)
-        ResultsFrame.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-        ResultsFrame.BorderSizePixel = 0
-        ResultsFrame.ZIndex = 20
-        ResultsFrame.Parent = mainGui
-        
-        local ResultsTitle = Instance.new("TextLabel")
-        ResultsTitle.Name = "ResultsTitle"
-        ResultsTitle.Size = UDim2.new(1, 0, 0, 30)
-        ResultsTitle.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-        ResultsTitle.BorderSizePixel = 0
-        ResultsTitle.Text = "Результаты переименования"
-        ResultsTitle.TextColor3 = Color3.new(1, 1, 1)
-        ResultsTitle.TextSize = 14
-        ResultsTitle.Parent = ResultsFrame
-        
-        local CloseResults = Instance.new("TextButton")
-        CloseResults.Name = "CloseResults"
-        CloseResults.Size = UDim2.new(0, 30, 0, 30)
-        CloseResults.Position = UDim2.new(1, -30, 0, 0)
-        CloseResults.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
-        CloseResults.BorderSizePixel = 0
-        CloseResults.Text = "X"
-        CloseResults.TextColor3 = Color3.new(1, 1, 1)
-        CloseResults.TextSize = 14
-        CloseResults.Parent = ResultsFrame
-        
-        CloseResults.MouseButton1Click:Connect(function()
-            ResultsFrame:Destroy()
-        end)
-        
-        local Content = Instance.new("ScrollingFrame")
-        Content.Name = "Content"
-        Content.Size = UDim2.new(1, -20, 1, -50)
-        Content.Position = UDim2.new(0, 10, 0, 40)
-        Content.BackgroundTransparency = 1
-        Content.ScrollBarThickness = 4
-        Content.CanvasSize = UDim2.new(0, 0, 0, 0)
-        Content.Parent = ResultsFrame
-        
-        local Summary = Instance.new("TextLabel")
-        Summary.Name = "Summary"
-        Summary.Size = UDim2.new(1, 0, 0, 50)
-        Summary.BackgroundTransparency = 1
-        Summary.Text = string.format("✅ Успешно: %d\n❌ Ошибок: %d\n📊 Всего: %d",
-            successCount, failCount, successCount + failCount)
-        Summary.TextColor3 = Color3.new(1, 1, 1)
-        Summary.TextSize = 14
-        Summary.TextWrapped = true
-        Summary.Parent = Content
-        
-        local OperationsList = Instance.new("TextLabel")
-        OperationsList.Name = "OperationsList"
-        OperationsList.Size = UDim2.new(1, 0, 0, 0)
-        OperationsList.Position = UDim2.new(0, 0, 0, 60)
-        OperationsList.BackgroundTransparency = 1
-        OperationsList.Text = ""
-        OperationsList.TextColor3 = Color3.new(1, 1, 1)
-        OperationsList.TextSize = 11
-        OperationsList.TextWrapped = true
-        OperationsList.TextXAlignment = Enum.TextXAlignment.Left
-        OperationsList.TextYAlignment = Enum.TextYAlignment.Top
-        OperationsList.Parent = Content
-        
-        -- Заполняем список операций
-        local operationsText = "Операции:\n"
-        for i, op in ipairs(renameOperations) do
-            local status = op.Success and "✅" or "❌"
-            local errorText = op.Error and " (" .. op.Error .. ")" or ""
-            operationsText = operationsText .. string.format("%s %s -> %s%s\n",
-                status, op.OriginalName, op.NewName, errorText)
-        end
-        
-        OperationsList.Text = operationsText
-        OperationsList.Size = UDim2.new(1, 0, 0, #renameOperations * 20 + 20)
-        Content.CanvasSize = UDim2.new(0, 0, 0, 60 + OperationsList.Size.Y.Offset)
-    end
-    
-    -- Перемещение GUI
-    local dragging
-    local dragInput
-    local dragStart
-    local startPos
-    
-    TopBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
-            dragStart = input.Position
-            startPos = MainFrame.Position
-            
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
-    end)
-    
-    TopBar.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement then
-            dragInput = input
-        end
-    end)
-    
-    UserInputService.InputChanged:Connect(function(input)
-        if input == dragInput and dragging then
-            local delta = input.Position - dragStart
-            MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
-        end
-    end)
-    
-    return mainGui
-end
-
--- Основная функция запуска
-local function initialize()
-    print("🚀 Remote Renamer v2.0 запущен!")
-    print("📋 Автономный скрипт для переименования ремоутов")
-    
-    -- Создаем GUI
-    local gui = createMenu()
-    gui.Parent = CoreGui
-    
-    -- Автоматически сканируем ремоуты при запуске
-    task.wait(1)
-    
-    if mainGui and mainGui.Parent then
-        -- Находим кнопку сканирования и имитируем клик
-        local success = pcall(function()
-            local mainFrame = mainGui:FindFirstChild("MainFrame")
-            if mainFrame then
-                local contentFrame = mainFrame:FindFirstChild("ContentFrame")
-                if contentFrame then
-                    local controlPanel = contentFrame:FindFirstChild("ControlPanel")
-                    if controlPanel then
-                        local scanButton = controlPanel:FindFirstChild("ScanButton")
-                        if scanButton then
-                            scanButton.BackgroundColor3 = Color3.fromRGB(100, 100, 255)
-                            task.wait(0.5)
-                            scanButton.BackgroundColor3 = Color3.fromRGB(60, 60, 60)
-                            scanRemotes()
-                        end
-                    end
-                end
+        -- Автоматическое закрытие через 10 секунд
+        delay(10, function()
+            if notification then
+                notification:Destroy()
             end
         end)
     end
     
-    print("✅ GUI успешно создан!")
-    print("📝 Используйте меню для управления переименованием")
+    -- Выводим отчет в консоль
+    print("\n" .. report)
+    log("Remote Renamer завершил работу")
+    
+    return {
+        TotalRemotes = #allRemotes,
+        Processed = processedRemotes,
+        Renamed = successfullyRenamed,
+        Script = finalScript,
+        Log = renameLog
+    }
 end
 
--- Запускаем скрипт
-initialize()
+-- Запускаем переименование
+local success, result = pcall(renameRemotes)
 
--- Возвращаем управляющие функции
-return {
-    ScanRemotes = function() 
-        if scanRemotes then 
-            scanRemotes() 
-        end 
-    end,
-    RenameAll = function() 
-        if renameAllRemotes then 
-            renameAllRemotes() 
-        end 
-    end,
-    GenerateScript = function() 
-        if generateRenameScript then 
-            generateRenameScript() 
-        end 
-    end,
-    ShowMenu = function()
-        if mainGui and mainGui.Parent then
-            mainGui.Enabled = not mainGui.Enabled
-        else
-            initialize()
+if not success then
+    log("Ошибка при выполнении: " .. tostring(result))
+    
+    -- Альтернативный простой метод
+    log("Пробуем простой метод переименования...")
+    
+    local simpleResult = pcall(function()
+        local allRemotes = findAllRemotes()
+        local simpleRenamed = 0
+        
+        for _, remoteData in ipairs(allRemotes) do
+            local remote = remoteData.Instance
+            local parentName = remote.Parent.Name
+            local cleanName = parentName:gsub("[^%w_]", "_")
+            
+            local newName
+            if remote:IsA("RemoteEvent") then
+                newName = cleanName .. "_Event"
+            elseif remote:IsA("RemoteFunction") then
+                newName = cleanName .. "_Function"
+            else
+                newName = cleanName .. "_Remote"
+            end
+            
+            if pcall(function() remote.Name = newName end) then
+                simpleRenamed = simpleRenamed + 1
+                log("Простое переименование: " .. remoteData.OriginalName .. " -> " .. newName)
+            end
         end
-    end
-}
+        
+        return simpleRenamed
+    end)
+    
+    log("Простой метод завершил: " .. (simpleResult and "успешно" or "с ошибкой"))
+end
+
+log("Скрипт Remote Renamer завершил выполнение")
